@@ -86,11 +86,23 @@ While this may change depending on your preferred browser you should manage to f
 
 
 On Android:
-* search for 'certificate' in parameters <img src="./docs/more-security.jpg" width="300" />
-* select 'install from device storage' <img src="./docs/install-from-storage.jpg" width="300" />
-* select 'CA certificate' install generate ${prefix}-root.pem certificate <img src="./docs/install-private-authority.jpg" width="300" />
-* select 'VPN & app certificate' install generated ${prefix}-client.pfx <img src="./docs/install-client-identity.jpg" width="300" /> Installation should request the password your used during certificate generation (if not provided default is: '9876543210')
-* select 'view security certificate' and check your certificate is installed <img src="./docs/view-installed-certificate.jpg" width="300" />
+#### search for 'certificate' in parameters 
+  <img src="./docs/more-security.jpg" width="300" />
+
+#### select 'install from device storage'
+   <img src="./docs/install-from-storage.jpg" width="300" />
+
+#### select 'CA certificate' install generate ${prefix}-root.pem certificate 
+   <img src="./docs/install-private-authority.jpg" width="300" />
+
+#### select 'VPN & app certificate' install generated ${prefix}-client.pfx 
+
+Installation should request the password your used during certificate generation (if not provided default is: '9876543210')
+
+   <img src="./docs/install-client-identity.jpg" width="300" /> 
+
+#### select 'view security certificate' and check your certificate is installed 
+   <img src="./docs/view-installed-certificate.jpg" width="300" />
 
 
 ### Check connectivity with your browser
