@@ -84,12 +84,13 @@ While this may change depending on your preferred browser you should manage to f
    * root certificate: should be imported in 'local certificate'
    * client certificate: should be imported in 'your certificate'
 
+
 On Android:
-* search for 'certificate' in parameters ![image](./docs/more-security.jpg)
-* select 'install from device storage' ![image](./docs/install-from-storage.jpg)
-* select 'CA certificate' install generate ${prefix}-root.pem certificate ![image](./docs/install-private-authority.jpg)
-* select 'VPN & app certificate' install generated ${prefix}-client.pfx ![image](./docs/install-client-identity.jpg) Installation should request the password your used during certificate generation (if not provided default is: '9876543210')
-* select 'view security certificate' and check your certificate is installed ![image](./docs/view-installed-certificate.jpg)
+* search for 'certificate' in parameters <img src="./docs/more-security.jpg" width="300" />
+* select 'install from device storage' <img src="./docs/install-from-storage.jpg" width="300" />
+* select 'CA certificate' install generate ${prefix}-root.pem certificate <img src="./docs/install-private-authority.jpg" width="300" />
+* select 'VPN & app certificate' install generated ${prefix}-client.pfx <img src="./docs/install-client-identity.jpg" width="300" /> Installation should request the password your used during certificate generation (if not provided default is: '9876543210')
+* select 'view security certificate' and check your certificate is installed <img src="./docs/view-installed-certificate.jpg" width="300" />
 
 
 ### Check connectivity with your browser
