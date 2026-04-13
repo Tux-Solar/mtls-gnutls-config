@@ -1,0 +1,40 @@
+#-----------------------------
+# mkcerts.conf.example — Copy this file to mkcerts.conf and edit it
+#
+# Usage:
+#   cp mkcerts.conf.example mkcerts.conf
+#   # Edit mkcerts.conf with your organization details
+#   ./mkcerts.sh init myprefix
+#
+# Tip: you can create prefix-specific configs named mkcerts-{prefix}.conf
+# (e.g., mkcerts-myinfra.conf) to override these defaults for a specific PKI.
+#-----------------------------
+
+# Organization name
+ORGANIZATION="MyCompany"
+
+# Organizational unit (team, department...)
+UNIT="IT Security"
+
+# State / Region
+STATE="Ile-de-France"
+
+# Country (two-letter ISO code)
+COUNTRY="FR"
+
+# User ID (owner of the CA)
+UID_FIELD="admin"
+
+# Common Name for the Root CA certificate
+CA_CN="mycompany-mtls-root"
+
+# Subject Alternative Name URI (informational, embedded in all certs)
+URI="https://mycompany.com/security/certificates"
+
+# Contact email (embedded in the CA cert)
+EMAIL="security@mycompany.com"
+
+# Certificate validity durations (in days)
+CA_EXPIRY_DAYS=36500       # ~100 years — CA is long-lived
+SERVER_EXPIRY_DAYS=730     # 2 years — recommended for production servers
+CLIENT_EXPIRY_DAYS=365     # 1 year  — recommended for client certs
