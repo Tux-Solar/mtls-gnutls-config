@@ -190,6 +190,21 @@ backend my_nodes
 1. **Root CA** (`{prefix}-root.pem`): Import as "Trusted Root Authority" in your OS/Browser.
 2. **Client Identity** (`{prefix}-client-{name}.pfx`): Import into your browser or mobile device (requires the password set during generation).
 
+## Bash Autocompletion
+
+To make the script even easier to use, you can enable bash autocompletion. This will allow you to press `TAB` to complete commands, prefixes, and even certificate names.
+
+### Enable for current session:
+```bash
+source mkcerts-completion.bash
+```
+
+### Enable permanently:
+Add the following line to your `~/.bashrc`:
+```bash
+source /path/to/mtls-gnutls-config/mkcerts-completion.bash
+```
+
 ---
 
 ## Troubleshooting
