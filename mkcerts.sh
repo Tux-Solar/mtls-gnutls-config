@@ -368,8 +368,9 @@ cmd_list() {
         else
             type="unknown"
         fi
-        cn="$(certtool --certificate-info --infile "${pem}" 2>/dev/null \
-            | grep -m1 "^\s*Common Name:" | sed 's/.*Common Name: //' || echo "n/a")"
+        # Support both inline CN in Subject line and legacy multiline format
+        cn="$(certtool --certificate-info --infile "${pem}" 2>/dev/null | sed -n '/Subject:.*CN=/ s/.*CN=\([^,]*\).*/\1/p; /^\s*Common Name:/ s/.*Common Name: //p' | head -n1)"
+        [[ -z "${cn}" ]] && cn="n/a"
         expiry="$(certtool --certificate-info --infile "${pem}" 2>/dev/null \
             | grep -m1 "Not After:" | sed 's/.*Not After: //' || echo "n/a")"
         printf "  %-10s %-45s %-28s %s\n" "${type}" "${basename}" "${cn}" "${expiry}"
