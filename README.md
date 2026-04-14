@@ -90,7 +90,7 @@ The script follows a `command <prefix> [options]` pattern.
 | Command | Description |
 |:---|:---|
 | `init <prefix>` | Initialize the Root CA for this prefix. |
-| `add-server <prefix> <host>` | Generate a server certificate (host can be DNS or IP). |
+| `add-server <prefix> <host1> [host2]...` | Generate a server certificate (supports multiple DNS, IP and Wildcards). |
 | `add-client <prefix> <name>` | Generate a client certificate for a specific user/device. |
 | `all <prefix> <host> [user]` | Shortcut: Run init + add-server + add-client in one go. |
 
@@ -119,10 +119,23 @@ The script follows a `command <prefix> [options]` pattern.
 ```
 
 ### 2. Add a Server
-The script automatically detects if you provide an IP or a DNS and sets `ip_address` or `dns_name` correctly. It also gives the server its own unique `uid`.
+The script supports multiple identifiers (Multi-SAN) and wildcards. It automatically detects if each argument is an IP or a DNS.
+
+**Single IP or DNS:**
 ```bash
 ./mkcerts.sh add-server myinfra home.example.com
 ./mkcerts.sh add-server myinfra 192.168.1.50
+```
+
+**Multi-SAN (mixed DNS and IP):**
+```bash
+./mkcerts.sh add-server myinfra iot.bzh 10.18.127.234 127.0.0.1
+```
+
+**Wildcard + Base Domain:**
+Wildcards (e.g., `*.iot.bzh`) only cover subdomains. To cover both `site.iot.bzh` and `iot.bzh`, specify both:
+```bash
+./mkcerts.sh add-server myinfra "*.iot.bzh" iot.bzh
 ```
 
 ### 3. Add a Client

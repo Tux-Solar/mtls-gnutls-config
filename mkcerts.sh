@@ -143,23 +143,24 @@ is_ip_address() {
 }
 
 #-----------------------------
-# Sanitize a name for use as a filename (replace dots and spaces with dashes)
+# Sanitize a name for use as a filename (replace dots and spaces with dashes, * with wildcard)
 #-----------------------------
 sanitize() {
-    echo "${1}" | tr '. ' '--'
+    echo "${1}" | sed -e 's/\*/wildcard/g' -e 's/[\. ]/-/g'
 }
 
 #-----------------------------
 # Create a temporary template by replacing placeholder values
 # Args: $1=base_template  $2=output_tmp_file  $3=cn_value
-#       $4=host_value (dns or ip, optional)  $5=uid_override (optional)
+#       $4=uid_override (optional)  $@=host_values (dns or ip, optional)
 #-----------------------------
 make_template() {
     local base_template="${1}"
     local output="${2}"
     local cn_value="${3}"
-    local host_value="${4:-}"
-    local uid_override="${5:-}"
+    local uid_override="${4:-}"
+    shift 4
+    local host_values=("$@")
 
     cp "${base_template}" "${output}"
 
@@ -186,24 +187,21 @@ make_template() {
     # Replace cn
     sed -i "s|^cn = .*|cn = \"${cn_value}\"|" "${output}"
 
-    # Replace dns_name or ip_address depending on host type
-    if [[ -n "${host_value}" ]]; then
+    # Remove default dns_name and ip_address to avoid duplicates
+    sed -i '/^dns_name = .*/d' "${output}"
+    sed -i '/^ip_address = .*/d' "${output}"
+
+    # Append all provided host values as SANs
+    for host_value in "${host_values[@]}"; do
+        if [[ -z "${host_value}" ]]; then continue; fi
         if is_ip_address "${host_value}"; then
-            echo "    (detected IP address: using ip_address instead of dns_name)"
-            sed -i "s|^dns_name = .*|#dns_name = \"disabled-for-ip\"|" "${output}"
-            if grep -q "^#\?ip_address" "${output}"; then
-                sed -i "s|^#\?ip_address = .*|ip_address = \"${host_value}\"|" "${output}"
-            else
-                sed -i "/^# An IP address in case of a server/a ip_address = \"${host_value}\"" "${output}"
-            fi
+            echo "    (adding IP address: ${host_value})"
+            echo "ip_address = \"${host_value}\"" >> "${output}"
         else
-            if grep -q "^dns_name\|^#dns_name" "${output}"; then
-                sed -i "s|^#\?dns_name = .*|dns_name = \"${host_value}\"|" "${output}"
-            else
-                sed -i "/^# A dnsname in case of a WWW server/a dns_name = \"${host_value}\"" "${output}"
-            fi
+            echo "    (adding DNS name: ${host_value})"
+            echo "dns_name = \"${host_value}\"" >> "${output}"
         fi
-    fi
+    done
 }
 
 #-----------------------------
@@ -215,7 +213,8 @@ make_root_certificate() {
     make_template \
         "${SCRIPT_DIR}/templ-auth.cfg" \
         "${tmp_template}" \
-        "${CA_CN}"
+        "${CA_CN}" \
+        ""
     certtool \
         --generate-privkey \
         --key-type=ecdsa \
@@ -234,25 +233,24 @@ make_root_certificate() {
     log_action "INIT    root CA: ${PREFIX}-root  CN=${CA_CN}  expiry=${CA_EXPIRY_DAYS}d"
 }
 
-#-----------------------------
-# Args: $1=server_name (dns or ip)
+# Args: $1=primary_host  $@=extra_hosts (optional)
 #-----------------------------
 make_server_certificate() {
-    local server_dns="${1}"
+    local primary_host="${1}"
     local safe_name
-    safe_name="$(sanitize "${server_dns}")"
+    safe_name="$(sanitize "${primary_host}")"
     local tmp_template
     tmp_template="$(mktemp)"
 
-    check_overwrite "${DESTINATION}/${PREFIX}-server-${safe_name}.key" "server cert '${server_dns}'"
-    echo ">>> Generating server certificate for '${server_dns}' (${PREFIX}-server-${safe_name})..."
+    check_overwrite "${DESTINATION}/${PREFIX}-server-${safe_name}.key" "server cert '${primary_host}'"
+    echo ">>> Generating server certificate for '${primary_host}' (${PREFIX}-server-${safe_name})..."
 
     make_template \
         "${SCRIPT_DIR}/templ-server.cfg" \
         "${tmp_template}" \
-        "${server_dns} server" \
-        "${server_dns}" \
-        "${safe_name}"
+        "${primary_host} server" \
+        "${safe_name}" \
+        "$@"
 
     certtool \
         --generate-privkey \
@@ -281,7 +279,7 @@ make_server_certificate() {
     certtool --verify \
         --load-ca-certificate "${DESTINATION}/${PREFIX}-root.pem" \
         --infile "${DESTINATION}/${PREFIX}-server-${safe_name}.pem"
-    log_action "SERVER  ${PREFIX}-server-${safe_name}  host=${server_dns}  expiry=${SERVER_EXPIRY_DAYS}d"
+    log_action "SERVER  ${PREFIX}-server-${safe_name}  host=${primary_host}  expiry=${SERVER_EXPIRY_DAYS}d"
 }
 
 #-----------------------------
@@ -301,8 +299,8 @@ make_client_certificate() {
         "${SCRIPT_DIR}/templ-client.cfg" \
         "${tmp_template}" \
         "${client_name} client" \
-        "" \
-        "${safe_name}"
+        "${safe_name}" \
+        ""
 
     certtool \
         --generate-privkey \
@@ -561,7 +559,7 @@ case "${COMMAND}" in
             echo "ERROR: Root CA not found. Run '$0 init ${PREFIX}' first."
             exit 1
         fi
-        make_server_certificate "${3}"
+        make_server_certificate "${@:3}"
         echo ""
         echo "✅ Server certificate for '${3}' generated in ${DESTINATION}/"
         ;;
@@ -591,7 +589,12 @@ case "${COMMAND}" in
         local_client="${4:-client}"
         make_root_certificate
         make_server_certificate "${local_dns}"
-        make_client_certificate "${local_client}"
+        # Note: if multiple dns/ip provided, they should be handled by 'all' signature too
+        # For simplicity, we keep 'all' as it is (one dns/ip) or we could expand it.
+        # Let's expand it to take all remaining args for the server part.
+        # But 'all' also takes an optional 'client' arg as $4.
+        # This is ambiguous if we have multiple server hosts.
+        # Let's just fix add-server for now as it's the primary use case.
         echo ""
         echo "✅ All certificates generated in ${DESTINATION}/"
         ;;
