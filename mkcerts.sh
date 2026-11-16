@@ -11,10 +11,10 @@ Usage: $0 [--force] <command> <prefix> [options]
 
 Commands:
   init         <prefix>                       Generate root CA only
-  add-server   <prefix> <dns_or_ip>           Generate a server certificate
+  add-server   <prefix> <dns_or_ip> [sans...] Generate a server certificate
   add-client   <prefix> <client_name>         Generate a client certificate
   all          <prefix> <dns_or_ip> [client]  Generate CA + server + client
-  list         <prefix>                        List all generated certificates
+  list         <prefix>                       List all generated certificates
   info         <prefix> <name>                Show details of a certificate
   check-expiry <prefix> [days]                List certs expiring within N days (default: 90)
   revoke       <prefix> <name>                Revoke a certificate (generate CRL)
@@ -39,14 +39,23 @@ Examples:
   $0 revoke myinfra jean-mobile
   $0 deploy myinfra myserver.example.com admin@myserver.example.com /etc/pki/nginx
 EOF
-    exit 1
+    exit "${1:-1}"
 }
+
+# --- Parse --help flag before anything else ---
+if [[ "${1:-}" =~ ^(-h|--help|help)$ ]]; then
+    usage 0
+fi
 
 # --- Parse --force flag ---
 FORCE=false
 if [[ "${1:-}" == "--force" ]]; then
     FORCE=true
     shift
+fi
+
+if [[ "${1:-}" =~ ^(-h|--help|help)$ ]]; then
+    usage 0
 fi
 
 # --- Check dependencies ---
@@ -85,11 +94,23 @@ load_config() {
 }
 
 if [[ $# -lt 2 ]]; then
-    usage
+    usage 1
 fi
 
 COMMAND="${1}"
 PREFIX="${2}"
+
+# --- Validate prefix ---
+if [[ "${PREFIX}" == -* ]]; then
+    echo "ERROR: Invalid prefix '${PREFIX}'. Flags like --force must come before the command (e.g., $0 --force ${COMMAND} ...)."
+    exit 1
+fi
+
+if [[ "${PREFIX}" =~ [^a-zA-Z0-9._-] ]]; then
+    echo "ERROR: Invalid prefix '${PREFIX}'. Only alphanumeric characters, dashes, dots, and underscores are allowed."
+    exit 1
+fi
+
 DESTINATION="${SCRIPT_DIR}/_certs-${PREFIX}"
 LOG_FILE="${DESTINATION}/generation.log"
 
@@ -101,6 +122,24 @@ if [[ -z "${PASSWORD:-}" ]]; then
     echo "         Use PASSWORD=yourpassword $0 ${COMMAND} ${PREFIX} ... for better security."
     PASSWORD="9876543210"
 fi
+
+#-----------------------------
+# Check that root CA exists for commands that require an existing PKI
+#-----------------------------
+require_root_ca() {
+    if [[ ! -d "${DESTINATION}" || ! -f "${DESTINATION}/${PREFIX}-root.key" || ! -f "${DESTINATION}/${PREFIX}-root.pem" ]]; then
+        echo "ERROR: Root CA not found for prefix '${PREFIX}'."
+        echo "       Expected in: ${DESTINATION}/"
+        echo "       Run '$0 init ${PREFIX}' first."
+        local available
+        available=$(find "${SCRIPT_DIR}" -maxdepth 1 -type d -name "_certs-*" 2>/dev/null | sed 's|.*/_certs-||' | sort | tr '\n' ' ')
+        if [[ -n "${available// /}" ]]; then
+            echo ""
+            echo "       Existing prefix(es) on this system: ${available}"
+        fi
+        exit 1
+    fi
+}
 
 #-----------------------------
 # Logging helper
@@ -537,10 +576,9 @@ cmd_deploy() {
 #-----------------------------
 # Command dispatch
 #-----------------------------
-mkdir -p "${DESTINATION}"
-
 case "${COMMAND}" in
     init)
+        mkdir -p "${DESTINATION}"
         make_root_certificate
         echo ""
         echo "✅ Root CA generated in ${DESTINATION}/"
@@ -550,91 +588,96 @@ case "${COMMAND}" in
         ;;
 
     add-server)
-        if [[ $# -lt 3 ]]; then
+        if [[ $# -lt 3 || -z "${3:-}" ]]; then
             echo "ERROR: Missing dns_name/ip argument."
-            echo "Usage: $0 add-server ${PREFIX} <dns_or_ip>"
+            echo "Usage: $0 add-server <prefix> <dns_or_ip> [sans...]"
             exit 1
         fi
-        if [[ ! -f "${DESTINATION}/${PREFIX}-root.key" ]]; then
-            echo "ERROR: Root CA not found. Run '$0 init ${PREFIX}' first."
-            exit 1
-        fi
+        require_root_ca
         make_server_certificate "${@:3}"
         echo ""
         echo "✅ Server certificate for '${3}' generated in ${DESTINATION}/"
         ;;
 
     add-client)
-        if [[ $# -lt 3 ]]; then
+        if [[ $# -lt 3 || -z "${3:-}" ]]; then
             echo "ERROR: Missing client_name argument."
-            echo "Usage: $0 add-client ${PREFIX} <client_name>"
+            echo "Usage: $0 add-client <prefix> <client_name>"
             exit 1
         fi
-        if [[ ! -f "${DESTINATION}/${PREFIX}-root.key" ]]; then
-            echo "ERROR: Root CA not found. Run '$0 init ${PREFIX}' first."
-            exit 1
-        fi
+        require_root_ca
         make_client_certificate "${3}"
         echo ""
         echo "✅ Client certificate for '${3}' generated in ${DESTINATION}/"
         ;;
 
     all)
-        if [[ $# -lt 3 ]]; then
+        if [[ $# -lt 3 || -z "${3:-}" ]]; then
             echo "ERROR: Missing dns_name argument."
-            echo "Usage: $0 all ${PREFIX} <dns_or_ip> [client_name]"
+            echo "Usage: $0 all <prefix> <dns_or_ip> [client_name]"
             exit 1
         fi
+        mkdir -p "${DESTINATION}"
         local_dns="${3}"
         local_client="${4:-client}"
         make_root_certificate
         make_server_certificate "${local_dns}"
-        # Note: if multiple dns/ip provided, they should be handled by 'all' signature too
-        # For simplicity, we keep 'all' as it is (one dns/ip) or we could expand it.
-        # Let's expand it to take all remaining args for the server part.
-        # But 'all' also takes an optional 'client' arg as $4.
-        # This is ambiguous if we have multiple server hosts.
-        # Let's just fix add-server for now as it's the primary use case.
+        make_client_certificate "${local_client}"
         echo ""
         echo "✅ All certificates generated in ${DESTINATION}/"
         ;;
 
     list)
+        require_root_ca
         cmd_list
         ;;
 
     info)
-        cmd_info "${3:-}"
+        if [[ $# -lt 3 || -z "${3:-}" ]]; then
+            echo "ERROR: Missing cert name. Usage: $0 info <prefix> <name>"
+            echo "       Use '$0 list ${PREFIX}' to see available certs."
+            exit 1
+        fi
+        require_root_ca
+        cmd_info "${3}"
         ;;
 
     check-expiry)
+        require_root_ca
+        if [[ -n "${3:-}" && ! "${3}" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: Invalid days argument '${3}'. Must be a positive integer."
+            echo "Usage: $0 check-expiry <prefix> [days]"
+            exit 1
+        fi
         cmd_check_expiry "${3:-90}"
         ;;
 
     revoke)
-        if [[ $# -lt 3 ]]; then
+        if [[ $# -lt 3 || -z "${3:-}" ]]; then
             echo "ERROR: Missing cert name."
-            echo "Usage: $0 revoke ${PREFIX} <name>"
+            echo "Usage: $0 revoke <prefix> <name>"
             exit 1
         fi
+        require_root_ca
         cmd_revoke "${3}"
         ;;
 
     deploy)
         if [[ $# -lt 4 ]]; then
             echo "ERROR: Missing arguments."
-            echo "Usage: $0 deploy ${PREFIX} <server_name> <user@host> [remote_dir]"
+            echo "Usage: $0 deploy <prefix> <server_name> <user@host> [remote_dir]"
             exit 1
         fi
+        require_root_ca
         cmd_deploy "${3}" "${4}" "${5:-/etc/pki/tls/certs}"
         ;;
 
-    -h|--help)
-        usage
+    -h|--help|help)
+        usage 0
         ;;
 
     *)
         echo "ERROR: Unknown command '${COMMAND}'"
-        usage
+        usage 1
         ;;
 esac
