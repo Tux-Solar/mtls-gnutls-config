@@ -2,7 +2,7 @@
 
 **Author:** Fulup Le Foll (fulup@iot.bzh)  
 **License:** MIT  
-**Date:** March 2026
+**Date:** March 2026 (Updated November 2026)
 
 ---
 
@@ -14,9 +14,9 @@
 
 - ✅ The client verifies the server's identity (like standard HTTPS)
 - ✅ The server verifies the client's identity (only authorized devices/users can connect)
-- 🔒 No password, no VPN, no token — just cryptographic proof of identity
+- 🔒 No passwords, no VPNs, no tokens — just cryptographic proof of identity
 
-This is ideal for **self-hosted services** (Home Assistant, Nextcloud, mail servers, etc.) where you want to ensure that only your own devices can access your infrastructure.
+This is ideal for **self-hosted services** (Home Assistant, Nextcloud, mail servers, APIs, etc.) where you want to ensure that only your authorized devices can reach your private services.
 
 ---
 
@@ -81,6 +81,39 @@ If you manage multiple separate PKIs, you can create a file named `mkcerts-{pref
 
 ---
 
+## Directory Layout
+
+All certificates generated for a prefix are cleanly organized inside `_certs-<prefix>/`:
+
+```text
+_certs-<prefix>/
+├── ca/
+│   ├── <prefix>-root.key         # Root CA private key (chmod 0600, ca/ directory chmod 0700)
+│   └── <prefix>-root.pem         # Root CA public certificate (trust anchor)
+├── servers/
+│   └── <server_name>/
+│       ├── <prefix>-server-<name>.key          # Private key (chmod 0600)
+│       ├── <prefix>-server-<name>.pem          # Server certificate
+│       ├── <prefix>-server-<name>.crt          # Full chain (server cert + root CA)
+│       ├── <prefix>-server-<name>-haproxy.pem  # Full chain + private key (for HAProxy, chmod 0600)
+│       └── <prefix>-root.pem                   # Copy of root CA for local reference
+├── clients/
+│   └── <client_name>/
+│       ├── <prefix>-client-<name>.key          # Private key (chmod 0600)
+│       ├── <prefix>-client-<name>.pem          # Client certificate
+│       ├── <prefix>-client-<name>.crt          # Full chain (client cert + root CA)
+│       ├── <prefix>-client-<name>.pfx          # PKCS#12 bundle (browser / mobile import, chmod 0600)
+│       ├── <prefix>-root.pem                   # Root CA copy for device import
+│       └── README.txt                          # Device installation instructions with password
+├── crl/
+│   └── <prefix>-crl.pem          # Certificate Revocation List
+└── generation.log                # Timestamped log of all operations
+```
+
+> **Automatic Migration:** If you have an existing PKI from an earlier version with flat files, `mkcerts.sh` automatically migrates it to this structured format the first time you run a command. You can also run `./mkcerts.sh migrate <prefix>`.
+
+---
+
 ## Usage Summary
 
 The script follows a `command <prefix> [options]` pattern.
@@ -90,38 +123,41 @@ The script follows a `command <prefix> [options]` pattern.
 | Command | Description |
 |:---|:---|
 | `init <prefix>` | Initialize the Root CA for this prefix. |
-| `add-server <prefix> <host1> [host2]...` | Generate a server certificate (supports multiple DNS, IP and Wildcards). |
-| `add-client <prefix> <name>` | Generate a client certificate for a specific user/device. |
-| `all <prefix> <host> [user]` | Shortcut: Run init + add-server + add-client in one go. |
+| `add-server <prefix> <host1> [host2]...` | Generate a server certificate (supports multiple DNS, IP and Wildcards) + HAProxy bundle. |
+| `add-client <prefix> <name>` | Generate a client certificate (+ PKCS#12 bundle and ready-to-use client folder). |
+| `all <prefix> <host> [user]` | Shortcut: Run init + add-server + add-client in one step. |
 
-### Management Commands
+### Distribution & Management Commands
 
 | Command | Description |
 |:---|:---|
-| `list <prefix>` | List all certificates generated for this prefix. |
+| `export-client <prefix> <name> [out.tar.gz]` | Package client `.pfx`, `root.pem`, and installation guide into a shareable archive. |
+| `list <prefix>` | List all certificates generated for this prefix with CN and expiry dates. |
 | `info <prefix> <name>` | Show full X.509 details for a specific certificate. |
-| `check-expiry <prefix> [days]` | List certificates expiring within N days (default: 90). |
-| `revoke <prefix> <name>` | Revoke a certificate and generate a CRL. |
-| `deploy <prefix> <host> <user@remote> [path]` | Copy server certs to a remote host via scp. |
+| `check-expiry <prefix> [days]` | Check certificates expiring within N days (default: 90). Returns exit code `0` (ok), `1` (expiring soon), or `2` (expired). |
+| `revoke <prefix> <name>` | Revoke a certificate and generate/update the CRL. |
+| `deploy <prefix> <host> <user@remote> [path]` | Copy server certs + root CA to a remote host via `scp`. |
+| `migrate <prefix>` | Organize legacy flat directory layout into subdirectories. |
 
 ### Flags & Options
 
-- `--force`: Add this before the command to overwrite existing files without asking.
-- `PASSWORD=xxx`: Set the password for client `.pfx` files (default: `9876543210`).
+- `--force`: Place before the command to overwrite existing certificates without prompting (e.g. `./mkcerts.sh --force add-client ...`).
+- `PASSWORD=xxx`: Explicitly specify the password for client `.pfx` files. If omitted in an interactive terminal, the script securely prompts for it without echoing. Defaults to `9876543210` in non-interactive environments.
 
 ---
 
 ## Step-by-Step Guide
 
-### 1. Initialize your CA
+### 1. Initialize your Root CA
 ```bash
 ./mkcerts.sh init myinfra
 ```
+This generates the private key `ca/myinfra-root.key` (protected with `0600` permissions) and public certificate `ca/myinfra-root.pem`.
 
-### 2. Add a Server
-The script supports multiple identifiers (Multi-SAN) and wildcards. It automatically detects if each argument is an IP or a DNS.
+### 2. Add a Server Certificate
+The script supports single hosts, multiple SANs (Subject Alternative Names), wildcards, and IPs:
 
-**Single IP or DNS:**
+**Single host (DNS or IP):**
 ```bash
 ./mkcerts.sh add-server myinfra home.example.com
 ./mkcerts.sh add-server myinfra 192.168.1.50
@@ -133,110 +169,144 @@ The script supports multiple identifiers (Multi-SAN) and wildcards. It automatic
 ```
 
 **Wildcard + Base Domain:**
-Wildcards (e.g., `*.iot.bzh`) only cover subdomains. To cover both `site.iot.bzh` and `iot.bzh`, specify both:
+Wildcards (`*.example.com`) cover only subdomains. To cover both `example.com` and all subdomains:
 ```bash
-./mkcerts.sh add-server myinfra "*.iot.bzh" iot.bzh
+./mkcerts.sh add-server myinfra "*.example.com" example.com
 ```
 
-### 3. Add a Client
-Each client gets a unique certificate with its own `uid`.
+### 3. Add a Client Certificate
 ```bash
-PASSWORD=StrongPass ./mkcerts.sh add-client myinfra phone-sylvain
+./mkcerts.sh add-client myinfra phone-sylvain
+```
+Or specify the password inline:
+```bash
+PASSWORD=StrongPassword ./mkcerts.sh add-client myinfra phone-sylvain
 ```
 
-### 4. Manage and Verify
+Each client gets its own subfolder `clients/<name>/` containing:
+- `<prefix>-client-<name>.pfx` (PKCS#12 bundle)
+- `<prefix>-root.pem` (Root CA to trust)
+- `README.txt` (Clear device import instructions)
+
+### 4. Package and Share a Client Certificate
+To send a certificate bundle to a user or mobile device:
 ```bash
-./mkcerts.sh list myinfra
+./mkcerts.sh export-client myinfra phone-sylvain
+```
+This creates `myinfra-phone-sylvain-bundle.tar.gz` ready to send.
+
+### 5. Check Expiration & Monitoring
+```bash
+# Check if any cert expires in the next 30 days
 ./mkcerts.sh check-expiry myinfra 30
 ```
+Because `check-expiry` returns non-zero when certificates are expiring or expired, you can use it directly in cron jobs or monitoring scripts.
 
 ---
 
-## Deployment
+## Reverse Proxy Deployment
 
 ### Nginx Configuration
 
-Copy the `.crt` (full chain) and `.key` to your server.
+Copy `<prefix>-server-<name>.crt`, `<prefix>-server-<name>.key`, and `<prefix>-root.pem` to your server (or use `./mkcerts.sh deploy ...`):
 
 ```nginx
 server {
-    listen 443 ssl;
+    listen 443 ssl http2;
     server_name home.example.com;
 
     # Server Identity
     ssl_certificate     /etc/nginx/certs/myinfra-server-home-example-com.crt;
     ssl_certificate_key /etc/nginx/certs/myinfra-server-home-example-com.key;
 
-    # mTLS Authentication
+    # mTLS Client Authentication
     ssl_client_certificate /etc/nginx/certs/myinfra-root.pem;
     ssl_verify_client on;
 
-    # Optional: CRL (Revocation List)
+    # Optional: Certificate Revocation List (CRL)
     # ssl_crl /etc/nginx/certs/myinfra-crl.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        
+        # Optional: forward client identity to backend
+        proxy_set_header X-SSL-Client-DN $ssl_client_s_dn;
+        proxy_set_header X-SSL-Client-Verify $ssl_client_verify;
+    }
 }
 ```
 
-### HAProxy Configuration (Centralized mTLS)
+### HAProxy Configuration
 
-HAProxy is ideal for centralizing mTLS and CRL management. You only need to update the CRL in one place.
+`mkcerts.sh` automatically generates `<prefix>-server-<name>-haproxy.pem` combining the full chain and private key:
 
 ```haproxy
 frontend https-in
-    bind *:443 ssl crt /etc/ssl/certs/home.example.com.pem ca-file /etc/ssl/ca/myinfra-root.pem verify required crl-file /etc/ssl/ca/myinfra-crl.pem
+    bind *:443 ssl crt /etc/ssl/certs/myinfra-server-home-example-com-haproxy.pem ca-file /etc/ssl/ca/myinfra-root.pem verify required crl-file /etc/ssl/ca/myinfra-crl.pem
 
-    # Pass the client's Subject DN (containing the unique UI) to the backend
+    # Pass client DN or UID to backend applications
     http-request set-header X-SSL-Client-DN %[ssl_c_s_dn]
-    
-    # Pass specifically the UID if needed
     http-request set-header X-SSL-Client-UID %[ssl_c_s_dn(uid)]
 
-    default_backend my_nodes
+    default_backend web_backend
 
-backend my_nodes
-    server node1 10.0.0.1:80 check
+backend web_backend
+    server srv1 127.0.0.1:8080 check
 ```
 
-> **Note:** In HAProxy, the server certificate and its private key must be concatenated into a single `.pem` file for the `crt` directive.
+---
 
-### Client Installation
+## Client Device Installation
 
-1. **Root CA** (`{prefix}-root.pem`): Import as "Trusted Root Authority" in your OS/Browser.
-2. **Client Identity** (`{prefix}-client-{name}.pfx`): Import into your browser or mobile device (requires the password set during generation).
+Each client needs two components:
+1. **Root CA** (`<prefix>-root.pem`): Installed as a trusted CA so the device trusts your server.
+2. **Client Identity** (`<prefix>-client-<name>.pfx`): Installed into the browser or system store to prove device identity.
+
+### Android
+1. Transfer `<prefix>-root.pem` and `<prefix>-client-<name>.pfx` to the device.
+2. Go to **Settings > Security & Privacy > Encryption & credentials** (or **Install a certificate**).
+3. Tap **CA certificate** and select `<prefix>-root.pem`.
+4. Tap **VPN & app user certificate** and select `<prefix>-client-<name>.pfx` (enter password).
+
+### iOS (iPhone / iPad)
+1. Send `<prefix>-root.pem` to your device via AirDrop or Mail.
+2. Go to **Settings > Profile Downloaded > Install**.
+3. Go to **Settings > General > About > Certificate Trust Settings** and enable full trust for your Root CA.
+4. Import `<prefix>-client-<name>.pfx` into your browser or device profile.
+
+### Firefox (Desktop)
+1. Open **Settings > Privacy & Security > Certificates > View Certificates**.
+2. Under **Authorities**, click **Import...** and select `<prefix>-root.pem` (check *Trust this CA to identify websites*).
+3. Under **Your Certificates**, click **Import...** and select `<prefix>-client-<name>.pfx` (enter password).
+
+---
 
 ## Bash Autocompletion
 
-To make the script even easier to use, you can enable bash autocompletion. This will allow you to press `TAB` to complete commands, prefixes, and even certificate names.
+Enable tab autocompletion for commands, prefixes, server names, and client names:
 
-### Enable for current session:
+### Current session:
 ```bash
 source mkcerts-completion.bash
 ```
 
-### Enable permanently:
-Add the following line to your `~/.bashrc`:
+### Permanent:
+Add to `~/.bashrc`:
 ```bash
 source /path/to/mtls-gnutls-config/mkcerts-completion.bash
 ```
 
 ---
 
-## Troubleshooting
+## Security Best Practices
 
-| Problem | Solution |
-|:---|:---|
-| `certtool: command not found` | Install `gnutls-utils` or `gnutls-bin`. |
-| `File already exists` | Use the `--force` flag: `./mkcerts.sh --force add-client ...` |
-| `400 Bad Request` (Nginx) | No client certificate presented or certificate not trusted by the root CA. |
-| `Certificate not trusted` | Ensure you imported the `root.pem` into the correct trust store. |
-| `Permission denied` | Check that your user has write access to the `_certs-...` directories. |
-
----
-
-## Security Notes
-
-1. **Protect `root.key`**: This is your most critical file. If leaked, your entire mTLS security is compromised.
-2. **Logs**: The script maintains a `generation.log` in each `_certs-...` folder to track all actions.
-3. **UIDs**: Each certificate now has a unique `uid` (server host or client name) for easier identification in logs.
+1. **Protect your Root CA**: `ca/<prefix>-root.key` is generated with `0600` permissions and the `ca/` folder with `0700`. Never copy the CA private key to server or client devices.
+2. **Revocation**: If a device is lost or compromised, immediately revoke its certificate:
+   ```bash
+   ./mkcerts.sh revoke myinfra phone-lost
+   ```
+   Deploy the updated CRL (`crl/<prefix>-crl.pem`) to Nginx or HAProxy.
+3. **Auditing**: Every generation, revocation, and deployment is logged to `generation.log`.
 
 ---
 

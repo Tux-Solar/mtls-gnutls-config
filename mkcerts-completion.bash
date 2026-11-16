@@ -14,7 +14,7 @@ _mkcerts_completions() {
         cword=$COMP_CWORD
     fi
 
-    local commands="init add-server add-client all list info check-expiry revoke deploy"
+    local commands="init add-server add-client all list info check-expiry revoke deploy export-client migrate"
     local flags="--force"
 
     # Identify command position (skip flags)
@@ -52,14 +52,40 @@ _mkcerts_completions() {
         if [[ -d "$cert_dir" ]]; then
             case "$cmd" in
                 info|revoke)
-                    # List all cert names (stripping prefix and extension)
-                    local names=$(find "$cert_dir" -maxdepth 1 -name "*.pem" 2>/dev/null | xargs -n1 basename 2>/dev/null | sed -e "s/^$prefix-//" -e "s/.pem$//" || true)
-                    COMPREPLY=( $(compgen -W "$names" -- "$cur") )
+                    # List all server and client names (new directory layout and legacy flat)
+                    local names=()
+                    if [[ -d "$cert_dir/servers" ]]; then
+                        names+=( $(find "$cert_dir/servers" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null) )
+                    fi
+                    if [[ -d "$cert_dir/clients" ]]; then
+                        names+=( $(find "$cert_dir/clients" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null) )
+                    fi
+                    local flat_names=$(find "$cert_dir" -maxdepth 1 -name "*.pem" 2>/dev/null | xargs -n1 basename 2>/dev/null | sed -e "s/^$prefix-//" -e "s/^client-//" -e "s/^server-//" -e "s/.pem$//" || true)
+                    names+=( $flat_names )
+                    local unique_names=$(printf "%s\n" "${names[@]}" | sort -u | tr '\n' ' ')
+                    COMPREPLY=( $(compgen -W "$unique_names" -- "$cur") )
                     ;;
                 deploy)
-                    # List only server names: filename is PREFIX-server-SAFE.pem
-                    local names=$(find "$cert_dir" -maxdepth 1 -name "$prefix-server-*.pem" 2>/dev/null | xargs -n1 basename 2>/dev/null | sed -e "s/^$prefix-server-//" -e "s/.pem$//" || true)
-                    COMPREPLY=( $(compgen -W "$names" -- "$cur") )
+                    # List only server names
+                    local names=()
+                    if [[ -d "$cert_dir/servers" ]]; then
+                        names+=( $(find "$cert_dir/servers" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null) )
+                    fi
+                    local flat_names=$(find "$cert_dir" -maxdepth 1 -name "$prefix-server-*.pem" 2>/dev/null | xargs -n1 basename 2>/dev/null | sed -e "s/^$prefix-server-//" -e "s/.pem$//" || true)
+                    names+=( $flat_names )
+                    local unique_names=$(printf "%s\n" "${names[@]}" | sort -u | tr '\n' ' ')
+                    COMPREPLY=( $(compgen -W "$unique_names" -- "$cur") )
+                    ;;
+                export-client)
+                    # List only client names
+                    local names=()
+                    if [[ -d "$cert_dir/clients" ]]; then
+                        names+=( $(find "$cert_dir/clients" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null) )
+                    fi
+                    local flat_names=$(find "$cert_dir" -maxdepth 1 -name "$prefix-client-*.pem" 2>/dev/null | xargs -n1 basename 2>/dev/null | sed -e "s/^$prefix-client-//" -e "s/.pem$//" || true)
+                    names+=( $flat_names )
+                    local unique_names=$(printf "%s\n" "${names[@]}" | sort -u | tr '\n' ' ')
+                    COMPREPLY=( $(compgen -W "$unique_names" -- "$cur") )
                     ;;
             esac
         fi

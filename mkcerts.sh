@@ -10,29 +10,38 @@ usage() {
 Usage: $0 [--force] <command> <prefix> [options]
 
 Commands:
-  init         <prefix>                       Generate root CA only
-  add-server   <prefix> <dns_or_ip> [sans...] Generate a server certificate
-  add-client   <prefix> <client_name>         Generate a client certificate
-  all          <prefix> <dns_or_ip> [client]  Generate CA + server + client
-  list         <prefix>                       List all generated certificates
-  info         <prefix> <name>                Show details of a certificate
-  check-expiry <prefix> [days]                List certs expiring within N days (default: 90)
-  revoke       <prefix> <name>                Revoke a certificate (generate CRL)
-  deploy       <prefix> <server_name> <user@host> [remote_dir]
-                                              Copy server cert + root CA via scp
+  init          <prefix>                       Generate root CA only
+  add-server    <prefix> <dns_or_ip> [sans...] Generate a server certificate (+ HAProxy bundle)
+  add-client    <prefix> <client_name>         Generate a client certificate (+ PKCS#12 bundle)
+  all           <prefix> <dns_or_ip> [client]  Generate CA + server + client
+  list          <prefix>                       List all generated certificates
+  info          <prefix> <name>                Show details of a certificate
+  check-expiry  <prefix> [days]                List certs expiring within N days (default: 90)
+  revoke        <prefix> <name>                Revoke a certificate (generate CRL)
+  deploy        <prefix> <server_name> <user@host> [remote_dir]
+                                               Copy server cert + root CA via scp
+  export-client <prefix> <client_name> [tar]   Create a ready-to-share client archive (.tar.gz)
+  migrate       <prefix>                       Migrate legacy flat layout to structured directories
+
+Directory layout (_certs-<prefix>/):
+  ca/           Root CA private key (0600) and certificate
+  servers/      Subdirectory per server (key 0600, cert, full chain, HAProxy bundle)
+  clients/      Subdirectory per client (key 0600, cert, .pfx 0600, root CA copy, README.txt)
+  crl/          Certificate Revocation List
 
 Flags:
-  --force    Overwrite existing certificates without prompting
+  --force       Overwrite existing certificates without prompting
 
 Options:
-  PASSWORD=xxx   Password for client .pfx (default: 9876543210)
+  PASSWORD=xxx  Password for client .pfx (default: interactive prompt or 9876543210)
 
 Examples:
   $0 init myinfra
   $0 add-server myinfra myserver.example.com
   $0 add-server myinfra 192.168.1.10
+  $0 add-server myinfra iot.bzh 10.18.127.234 127.0.0.1
   $0 add-client myinfra jean-mobile
-  $0 --force add-client myinfra jean-mobile
+  $0 export-client myinfra jean-mobile
   $0 list myinfra
   $0 info myinfra jean-mobile
   $0 check-expiry myinfra 30
@@ -112,24 +121,114 @@ if [[ "${PREFIX}" =~ [^a-zA-Z0-9._-] ]]; then
 fi
 
 DESTINATION="${SCRIPT_DIR}/_certs-${PREFIX}"
+CA_DIR="${DESTINATION}/ca"
+SERVERS_DIR="${DESTINATION}/servers"
+CLIENTS_DIR="${DESTINATION}/clients"
+CRL_DIR="${DESTINATION}/crl"
 LOG_FILE="${DESTINATION}/generation.log"
 
 load_config "${PREFIX}"
 
-# --- Password ---
-if [[ -z "${PASSWORD:-}" ]]; then
-    echo "WARNING: No PASSWORD set, using default password '9876543210'."
-    echo "         Use PASSWORD=yourpassword $0 ${COMMAND} ${PREFIX} ... for better security."
-    PASSWORD="9876543210"
-fi
+# --- Password Helper ---
+ensure_password() {
+    if [[ -z "${PASSWORD:-}" ]]; then
+        if [[ -t 0 ]]; then
+            read -s -r -p "Enter password for client .pfx (press Enter for default '9876543210'): " input_pwd
+            echo ""
+            if [[ -n "${input_pwd}" ]]; then
+                PASSWORD="${input_pwd}"
+            else
+                PASSWORD="9876543210"
+            fi
+        else
+            echo "WARNING: No PASSWORD set, using default password '9876543210'."
+            echo "         Set PASSWORD=yourpassword for better security."
+            PASSWORD="9876543210"
+        fi
+    fi
+}
+
+#-----------------------------
+# Check & resolve root CA paths
+#-----------------------------
+find_root_ca() {
+    if [[ -f "${CA_DIR}/${PREFIX}-root.key" && -f "${CA_DIR}/${PREFIX}-root.pem" ]]; then
+        ROOT_KEY="${CA_DIR}/${PREFIX}-root.key"
+        ROOT_PEM="${CA_DIR}/${PREFIX}-root.pem"
+        return 0
+    elif [[ -f "${DESTINATION}/${PREFIX}-root.key" && -f "${DESTINATION}/${PREFIX}-root.pem" ]]; then
+        ROOT_KEY="${DESTINATION}/${PREFIX}-root.key"
+        ROOT_PEM="${DESTINATION}/${PREFIX}-root.pem"
+        return 0
+    fi
+    return 1
+}
+
+#-----------------------------
+# Migrate legacy flat layout to structured directories
+#-----------------------------
+migrate_structure() {
+    if [[ -d "${DESTINATION}" && ! -d "${CA_DIR}" && -f "${DESTINATION}/${PREFIX}-root.key" ]]; then
+        echo ">>> Migrating legacy flat directory structure to structured subdirectories..."
+        mkdir -p "${CA_DIR}" "${SERVERS_DIR}" "${CLIENTS_DIR}" "${CRL_DIR}"
+        chmod 700 "${CA_DIR}"
+
+        # 1. Move root CA
+        mv "${DESTINATION}/${PREFIX}-root."* "${CA_DIR}/" 2>/dev/null || true
+        chmod 600 "${CA_DIR}/${PREFIX}-root.key" 2>/dev/null || true
+        chmod 644 "${CA_DIR}/${PREFIX}-root.pem" 2>/dev/null || true
+
+        # 2. Move servers
+        for key in "${DESTINATION}/${PREFIX}-server-"*.key; do
+            [[ -f "${key}" ]] || continue
+            local sname
+            sname="$(basename "${key}" .key | sed "s/^${PREFIX}-server-//")"
+            mkdir -p "${SERVERS_DIR}/${sname}"
+            mv "${DESTINATION}/${PREFIX}-server-${sname}".* "${SERVERS_DIR}/${sname}/" 2>/dev/null || true
+            chmod 600 "${SERVERS_DIR}/${sname}/${PREFIX}-server-${sname}.key" 2>/dev/null || true
+
+            # Generate HAProxy combined pem if missing
+            local scrt="${SERVERS_DIR}/${sname}/${PREFIX}-server-${sname}.crt"
+            local skey="${SERVERS_DIR}/${sname}/${PREFIX}-server-${sname}.key"
+            local shaproxy="${SERVERS_DIR}/${sname}/${PREFIX}-server-${sname}-haproxy.pem"
+            if [[ -f "${scrt}" && -f "${skey}" && ! -f "${shaproxy}" ]]; then
+                cat "${scrt}" "${skey}" > "${shaproxy}"
+                chmod 600 "${shaproxy}"
+            fi
+        done
+
+        # 3. Move clients
+        for key in "${DESTINATION}/${PREFIX}-client-"*.key; do
+            [[ -f "${key}" ]] || continue
+            local cname
+            cname="$(basename "${key}" .key | sed "s/^${PREFIX}-client-//")"
+            mkdir -p "${CLIENTS_DIR}/${cname}"
+            mv "${DESTINATION}/${PREFIX}-client-${cname}".* "${CLIENTS_DIR}/${cname}/" 2>/dev/null || true
+            chmod 600 "${CLIENTS_DIR}/${cname}/${PREFIX}-client-${cname}.key" 2>/dev/null || true
+            chmod 600 "${CLIENTS_DIR}/${cname}/${PREFIX}-client-${cname}.pfx" 2>/dev/null || true
+            cp "${CA_DIR}/${PREFIX}-root.pem" "${CLIENTS_DIR}/${cname}/" 2>/dev/null || true
+        done
+
+        # 4. Move CRL
+        if [[ -f "${DESTINATION}/${PREFIX}-crl.pem" ]]; then
+            mv "${DESTINATION}/${PREFIX}-crl.pem" "${CRL_DIR}/" 2>/dev/null || true
+        fi
+        echo "    ✓ Migration complete!"
+    fi
+}
 
 #-----------------------------
 # Check that root CA exists for commands that require an existing PKI
 #-----------------------------
 require_root_ca() {
-    if [[ ! -d "${DESTINATION}" || ! -f "${DESTINATION}/${PREFIX}-root.key" || ! -f "${DESTINATION}/${PREFIX}-root.pem" ]]; then
+    # If legacy flat structure is detected, auto-migrate to organized directories
+    if [[ -d "${DESTINATION}" && ! -d "${CA_DIR}" && -f "${DESTINATION}/${PREFIX}-root.key" ]]; then
+        migrate_structure
+    fi
+
+    if ! find_root_ca; then
         echo "ERROR: Root CA not found for prefix '${PREFIX}'."
-        echo "       Expected in: ${DESTINATION}/"
+        echo "       Expected in: ${CA_DIR}/"
         echo "       Run '$0 init ${PREFIX}' first."
         local available
         available=$(find "${SCRIPT_DIR}" -maxdepth 1 -type d -name "_certs-*" 2>/dev/null | sed 's|.*/_certs-||' | sort | tr '\n' ' ')
@@ -245,7 +344,13 @@ make_template() {
 
 #-----------------------------
 make_root_certificate() {
-    check_overwrite "${DESTINATION}/${PREFIX}-root.key" "Root CA"
+    mkdir -p "${CA_DIR}"
+    chmod 700 "${CA_DIR}"
+
+    local root_key="${CA_DIR}/${PREFIX}-root.key"
+    local root_pem="${CA_DIR}/${PREFIX}-root.pem"
+
+    check_overwrite "${root_key}" "Root CA"
     local tmp_template
     tmp_template="$(mktemp)"
     echo ">>> Generating root CA certificate (${PREFIX}-root)..."
@@ -259,16 +364,23 @@ make_root_certificate() {
         --key-type=ecdsa \
         --curve=secp256r1 \
         --no-text \
-        --outfile="${DESTINATION}/${PREFIX}-root.key"
+        --outfile="${root_key}"
+    chmod 600 "${root_key}"
+
     certtool \
         --generate-self-signed \
         --template="${tmp_template}" \
-        --load-privkey="${DESTINATION}/${PREFIX}-root.key" \
+        --load-privkey="${root_key}" \
         --no-text \
-        --outfile="${DESTINATION}/${PREFIX}-root.pem"
+        --outfile="${root_pem}"
+    chmod 644 "${root_pem}"
+
     rm -f "${tmp_template}"
-    echo "    ✓ ${DESTINATION}/${PREFIX}-root.key"
-    echo "    ✓ ${DESTINATION}/${PREFIX}-root.pem"
+    ROOT_KEY="${root_key}"
+    ROOT_PEM="${root_pem}"
+
+    echo "    ✓ ${root_key} (private key, chmod 0600)"
+    echo "    ✓ ${root_pem} (root CA certificate)"
     log_action "INIT    root CA: ${PREFIX}-root  CN=${CA_CN}  expiry=${CA_EXPIRY_DAYS}d"
 }
 
@@ -278,11 +390,19 @@ make_server_certificate() {
     local primary_host="${1}"
     local safe_name
     safe_name="$(sanitize "${primary_host}")"
+    local server_dir="${SERVERS_DIR}/${safe_name}"
+    mkdir -p "${server_dir}"
+
+    local s_key="${server_dir}/${PREFIX}-server-${safe_name}.key"
+    local s_pem="${server_dir}/${PREFIX}-server-${safe_name}.pem"
+    local s_crt="${server_dir}/${PREFIX}-server-${safe_name}.crt"
+    local s_haproxy="${server_dir}/${PREFIX}-server-${safe_name}-haproxy.pem"
+
+    check_overwrite "${s_key}" "server cert '${primary_host}'"
+    echo ">>> Generating server certificate for '${primary_host}' (${PREFIX}-server-${safe_name})..."
+
     local tmp_template
     tmp_template="$(mktemp)"
-
-    check_overwrite "${DESTINATION}/${PREFIX}-server-${safe_name}.key" "server cert '${primary_host}'"
-    echo ">>> Generating server certificate for '${primary_host}' (${PREFIX}-server-${safe_name})..."
 
     make_template \
         "${SCRIPT_DIR}/templ-server.cfg" \
@@ -296,28 +416,42 @@ make_server_certificate() {
         --key-type=ecdsa \
         --curve=secp256r1 \
         --no-text \
-        --outfile="${DESTINATION}/${PREFIX}-server-${safe_name}.key"
+        --outfile="${s_key}"
+    chmod 600 "${s_key}"
+
     certtool \
         --generate-certificate \
         --template="${tmp_template}" \
-        --load-privkey="${DESTINATION}/${PREFIX}-server-${safe_name}.key" \
-        --load-ca-privkey="${DESTINATION}/${PREFIX}-root.key" \
-        --load-ca-certificate="${DESTINATION}/${PREFIX}-root.pem" \
+        --load-privkey="${s_key}" \
+        --load-ca-privkey="${ROOT_KEY}" \
+        --load-ca-certificate="${ROOT_PEM}" \
         --no-text \
-        --outfile="${DESTINATION}/${PREFIX}-server-${safe_name}.pem"
-    cat "${DESTINATION}/${PREFIX}-server-${safe_name}.pem" \
-        "${DESTINATION}/${PREFIX}-root.pem" \
-        > "${DESTINATION}/${PREFIX}-server-${safe_name}.crt"
+        --outfile="${s_pem}"
+    chmod 644 "${s_pem}"
+
+    # Full chain (server cert + root CA) for Nginx / standard TLS
+    cat "${s_pem}" "${ROOT_PEM}" > "${s_crt}"
+    chmod 644 "${s_crt}"
+
+    # HAProxy bundle (full chain + private key)
+    cat "${s_crt}" "${s_key}" > "${s_haproxy}"
+    chmod 600 "${s_haproxy}"
+
+    # Keep a copy of Root CA in the server directory
+    cp "${ROOT_PEM}" "${server_dir}/${PREFIX}-root.pem"
+    chmod 644 "${server_dir}/${PREFIX}-root.pem"
 
     rm -f "${tmp_template}"
 
-    echo "    ✓ ${DESTINATION}/${PREFIX}-server-${safe_name}.key"
-    echo "    ✓ ${DESTINATION}/${PREFIX}-server-${safe_name}.pem"
-    echo "    ✓ ${DESTINATION}/${PREFIX}-server-${safe_name}.crt (full chain)"
+    echo "    ✓ ${s_key} (private key, chmod 0600)"
+    echo "    ✓ ${s_pem} (server certificate)"
+    echo "    ✓ ${s_crt} (full chain: server + root CA)"
+    echo "    ✓ ${s_haproxy} (combined bundle for HAProxy, chmod 0600)"
+    echo "    ✓ ${server_dir}/${PREFIX}-root.pem (root CA copy)"
     echo "    Verifying server certificate chain..."
     certtool --verify \
-        --load-ca-certificate "${DESTINATION}/${PREFIX}-root.pem" \
-        --infile "${DESTINATION}/${PREFIX}-server-${safe_name}.pem"
+        --load-ca-certificate "${ROOT_PEM}" \
+        --infile "${s_pem}"
     log_action "SERVER  ${PREFIX}-server-${safe_name}  host=${primary_host}  expiry=${SERVER_EXPIRY_DAYS}d"
 }
 
@@ -328,11 +462,22 @@ make_client_certificate() {
     local client_name="${1}"
     local safe_name
     safe_name="$(sanitize "${client_name}")"
+    local client_dir="${CLIENTS_DIR}/${safe_name}"
+    mkdir -p "${client_dir}"
+
+    local c_key="${client_dir}/${PREFIX}-client-${safe_name}.key"
+    local c_pem="${client_dir}/${PREFIX}-client-${safe_name}.pem"
+    local c_crt="${client_dir}/${PREFIX}-client-${safe_name}.crt"
+    local c_pfx="${client_dir}/${PREFIX}-client-${safe_name}.pfx"
+    local c_readme="${client_dir}/README.txt"
+
+    check_overwrite "${c_key}" "client cert '${client_name}'"
+    ensure_password
+
+    echo ">>> Generating client certificate for '${client_name}' (${PREFIX}-client-${safe_name})..."
+
     local tmp_template
     tmp_template="$(mktemp)"
-
-    check_overwrite "${DESTINATION}/${PREFIX}-client-${safe_name}.key" "client cert '${client_name}'"
-    echo ">>> Generating client certificate for '${client_name}' (${PREFIX}-client-${safe_name})..."
 
     make_template \
         "${SCRIPT_DIR}/templ-client.cfg" \
@@ -346,54 +491,141 @@ make_client_certificate() {
         --key-type=ecdsa \
         --curve=secp256r1 \
         --no-text \
-        --outfile="${DESTINATION}/${PREFIX}-client-${safe_name}.key"
+        --outfile="${c_key}"
+    chmod 600 "${c_key}"
+
     certtool \
         --generate-certificate \
         --template="${tmp_template}" \
-        --load-privkey="${DESTINATION}/${PREFIX}-client-${safe_name}.key" \
-        --load-ca-privkey="${DESTINATION}/${PREFIX}-root.key" \
-        --load-ca-certificate="${DESTINATION}/${PREFIX}-root.pem" \
+        --load-privkey="${c_key}" \
+        --load-ca-privkey="${ROOT_KEY}" \
+        --load-ca-certificate="${ROOT_PEM}" \
         --no-text \
-        --outfile="${DESTINATION}/${PREFIX}-client-${safe_name}.pem"
-    cat "${DESTINATION}/${PREFIX}-client-${safe_name}.pem" \
-        "${DESTINATION}/${PREFIX}-root.pem" \
-        > "${DESTINATION}/${PREFIX}-client-${safe_name}.crt"
+        --outfile="${c_pem}"
+    chmod 644 "${c_pem}"
+
+    cat "${c_pem}" "${ROOT_PEM}" > "${c_crt}"
+    chmod 644 "${c_crt}"
 
     certtool \
-        --load-ca-certificate "${DESTINATION}/${PREFIX}-root.pem" \
-        --load-privkey "${DESTINATION}/${PREFIX}-client-${safe_name}.key" \
-        --load-certificate "${DESTINATION}/${PREFIX}-client-${safe_name}.pem" \
+        --load-ca-certificate "${ROOT_PEM}" \
+        --load-privkey "${c_key}" \
+        --load-certificate "${c_pem}" \
         --to-p12 --p12-name "${PREFIX}@${safe_name}" \
         --password="${PASSWORD}" \
-        --outder --outfile "${DESTINATION}/${PREFIX}-client-${safe_name}.pfx"
+        --outder --outfile "${c_pfx}"
+    chmod 600 "${c_pfx}"
+
+    # Copy Root CA to the client directory
+    cp "${ROOT_PEM}" "${client_dir}/${PREFIX}-root.pem"
+    chmod 644 "${client_dir}/${PREFIX}-root.pem"
+
+    # Create installation instructions in the client folder
+    cat > "${c_readme}" <<EOF
+===================================================================
+mTLS Client Certificate Bundle for: ${client_name}
+PKI Prefix: ${PREFIX}
+Generated: $(date -u '+%Y-%m-%d %H:%M:%SZ')
+===================================================================
+
+Files in this bundle:
+  1. ${PREFIX}-root.pem
+     Root CA certificate. Install as a "Trusted Root Certificate"
+     on your device (Android, iOS, macOS, Windows, Linux).
+
+  2. ${PREFIX}-client-${safe_name}.pfx
+     Client certificate and private key in PKCS#12 format.
+     Import into your browser or device user certificates.
+     PFX Password: ${PASSWORD}
+
+Quick Installation:
+-------------------
+- Android:
+  1. Transfer both files to the phone.
+  2. Settings > Security & Privacy > More security settings > Encryption & credentials.
+  3. "Install a certificate" > "CA certificate" -> Select ${PREFIX}-root.pem.
+  4. "Install a certificate" > "VPN & app user certificate" -> Select ${PREFIX}-client-${safe_name}.pfx (enter password).
+
+- iOS:
+  1. Send ${PREFIX}-root.pem via AirDrop or Mail.
+  2. Settings > Profile Downloaded > Install.
+  3. Settings > General > About > Certificate Trust Settings > Enable full trust for Root CA.
+  4. Import ${PREFIX}-client-${safe_name}.pfx into your profile or browser.
+
+- Firefox:
+  1. Settings > Privacy & Security > Certificates > View Certificates.
+  2. "Authorities" tab -> Import ${PREFIX}-root.pem (check "Trust this CA to identify websites").
+  3. "Your Certificates" tab -> Import ${PREFIX}-client-${safe_name}.pfx (enter password).
+
+- Chrome / Edge / macOS Keychain / Windows:
+  1. Double click ${PREFIX}-root.pem to install into "Trusted Root Certification Authorities".
+  2. Double click ${PREFIX}-client-${safe_name}.pfx to import client certificate (enter password).
+EOF
 
     rm -f "${tmp_template}"
 
-    echo "    ✓ ${DESTINATION}/${PREFIX}-client-${safe_name}.key"
-    echo "    ✓ ${DESTINATION}/${PREFIX}-client-${safe_name}.pem"
-    echo "    ✓ ${DESTINATION}/${PREFIX}-client-${safe_name}.crt (full chain)"
-    echo "    ✓ ${DESTINATION}/${PREFIX}-client-${safe_name}.pfx (PKCS#12)"
+    echo "    ✓ ${c_key} (private key, chmod 0600)"
+    echo "    ✓ ${c_pem} (client certificate)"
+    echo "    ✓ ${c_crt} (full chain)"
+    echo "    ✓ ${c_pfx} (PKCS#12 bundle, chmod 0600)"
+    echo "    ✓ ${client_dir}/${PREFIX}-root.pem (root CA copy)"
+    echo "    ✓ ${c_readme} (installation instructions)"
     echo "    Verifying client certificate chain..."
     certtool --verify \
-        --load-ca-certificate "${DESTINATION}/${PREFIX}-root.pem" \
-        --infile "${DESTINATION}/${PREFIX}-client-${safe_name}.pem"
+        --load-ca-certificate "${ROOT_PEM}" \
+        --infile "${c_pem}"
     log_action "CLIENT  ${PREFIX}-client-${safe_name}  name=${client_name}  expiry=${CLIENT_EXPIRY_DAYS}d"
+}
+
+#-----------------------------
+# export-client: package client files into an archive
+#-----------------------------
+cmd_export_client() {
+    local name="${1:-}"
+    if [[ -z "${name}" ]]; then
+        echo "ERROR: Missing client name. Usage: $0 export-client <prefix> <client_name> [output_file]"
+        exit 1
+    fi
+    local safe_name
+    safe_name="$(sanitize "${name}")"
+    local client_dir="${CLIENTS_DIR}/${safe_name}"
+
+    if [[ ! -d "${client_dir}" ]]; then
+        echo "ERROR: Client '${name}' not found in ${CLIENTS_DIR}/"
+        exit 1
+    fi
+
+    local archive_name="${2:-${SCRIPT_DIR}/${PREFIX}-${safe_name}-bundle.tar.gz}"
+    tar -czf "${archive_name}" -C "${client_dir}" \
+        "${PREFIX}-client-${safe_name}.pfx" \
+        "${PREFIX}-root.pem" \
+        "README.txt"
+
+    echo "✅ Exported client bundle: ${archive_name}"
+    echo "   Contents: .pfx (credentials), root.pem (trust anchor), and README.txt instructions."
 }
 
 #-----------------------------
 # list: display all certs in the prefix directory
 #-----------------------------
 cmd_list() {
-    if [[ ! -d "${DESTINATION}" ]]; then
-        echo "ERROR: No certificates found for prefix '${PREFIX}'. Run 'init ${PREFIX}' first."
-        exit 1
-    fi
     echo "Certificates in ${DESTINATION}/:"
     echo ""
     printf "  %-10s %-45s %-28s %s\n" "TYPE" "FILE" "CN" "EXPIRES"
     printf "  %-10s %-45s %-28s %s\n" "----" "----" "--" "-------"
-    for pem in "${DESTINATION}"/*.pem; do
+
+    local pems=()
+    while IFS= read -r -d $'\0' file; do
+        pems+=("$file")
+    done < <(find "${DESTINATION}" -type f -name "*.pem" ! -name "*-haproxy.pem" ! -name "*-crl.pem" -print0 2>/dev/null | sort -z)
+
+    for pem in "${pems[@]}"; do
         [[ -f "${pem}" ]] || continue
+        # Ignore redundant root CA copies in client or server subdirs
+        if [[ "${pem}" =~ /(clients|servers)/[^/]+/${PREFIX}-root\.pem$ ]]; then
+            continue
+        fi
+
         local basename type cn expiry
         basename="$(basename "${pem}" .pem)"
         if [[ "${basename}" == *"-root" ]]; then
@@ -405,7 +637,7 @@ cmd_list() {
         else
             type="unknown"
         fi
-        # Support both inline CN in Subject line and legacy multiline format
+
         cn="$(certtool --certificate-info --infile "${pem}" 2>/dev/null | sed -n '/Subject:.*CN=/ s/.*CN=\([^,]*\).*/\1/p; /^\s*Common Name:/ s/.*Common Name: //p' | head -n1)"
         [[ -z "${cn}" ]] && cn="n/a"
         expiry="$(certtool --certificate-info --infile "${pem}" 2>/dev/null \
@@ -421,7 +653,7 @@ cmd_list() {
 cmd_info() {
     local name="${1:-}"
     if [[ -z "${name}" ]]; then
-        echo "ERROR: Missing cert name. Usage: $0 info ${PREFIX} <name>"
+        echo "ERROR: Missing cert name. Usage: $0 info <prefix> <name>"
         echo "       Use '$0 list ${PREFIX}' to see available certs."
         exit 1
     fi
@@ -429,6 +661,9 @@ cmd_info() {
     safe_name="$(sanitize "${name}")"
     local pem=""
     for candidate in \
+        "${CLIENTS_DIR}/${safe_name}/${PREFIX}-client-${safe_name}.pem" \
+        "${SERVERS_DIR}/${safe_name}/${PREFIX}-server-${safe_name}.pem" \
+        "${CA_DIR}/${PREFIX}-root.pem" \
         "${DESTINATION}/${PREFIX}-client-${safe_name}.pem" \
         "${DESTINATION}/${PREFIX}-server-${safe_name}.pem" \
         "${DESTINATION}/${PREFIX}-root.pem"; do
@@ -452,17 +687,25 @@ cmd_info() {
 #-----------------------------
 cmd_check_expiry() {
     local threshold="${1:-90}"
-    if [[ ! -d "${DESTINATION}" ]]; then
-        echo "ERROR: No certificates found for prefix '${PREFIX}'."
-        exit 1
-    fi
     local threshold_epoch
     threshold_epoch=$(date -d "+${threshold} days" +%s)
     local found=false
+    local has_expired=false
+
     echo "Checking certificates expiring within ${threshold} days in ${DESTINATION}/:"
     echo ""
-    for pem in "${DESTINATION}"/*.pem; do
+
+    local pems=()
+    while IFS= read -r -d $'\0' file; do
+        pems+=("$file")
+    done < <(find "${DESTINATION}" -type f -name "*.pem" ! -name "*-haproxy.pem" ! -name "*-crl.pem" -print0 2>/dev/null | sort -z)
+
+    for pem in "${pems[@]}"; do
         [[ -f "${pem}" ]] || continue
+        if [[ "${pem}" =~ /(clients|servers)/[^/]+/${PREFIX}-root\.pem$ ]]; then
+            continue
+        fi
+
         local expiry_str expiry_epoch basename days_left
         basename="$(basename "${pem}" .pem)"
         expiry_str="$(certtool --certificate-info --infile "${pem}" 2>/dev/null \
@@ -473,16 +716,26 @@ cmd_check_expiry() {
         if [[ ${expiry_epoch} -le ${threshold_epoch} ]]; then
             if [[ ${days_left} -le 0 ]]; then
                 echo "  ⛔ EXPIRED    ${basename}  (expired ${expiry_str})"
+                has_expired=true
             else
                 echo "  ⚠️  ${days_left} days    ${basename}  (expires ${expiry_str})"
             fi
             found=true
         fi
     done
+
     if [[ "${found}" == false ]]; then
         echo "  ✅ All certificates are valid for more than ${threshold} days."
+        echo ""
+        return 0
+    else
+        echo ""
+        if [[ "${has_expired}" == true ]]; then
+            return 2
+        else
+            return 1
+        fi
     fi
-    echo ""
 }
 
 #-----------------------------
@@ -491,13 +744,15 @@ cmd_check_expiry() {
 cmd_revoke() {
     local name="${1:-}"
     if [[ -z "${name}" ]]; then
-        echo "ERROR: Missing cert name. Usage: $0 revoke ${PREFIX} <name>"
+        echo "ERROR: Missing cert name. Usage: $0 revoke <prefix> <name>"
         exit 1
     fi
     local safe_name
     safe_name="$(sanitize "${name}")"
     local pem=""
     for candidate in \
+        "${CLIENTS_DIR}/${safe_name}/${PREFIX}-client-${safe_name}.pem" \
+        "${SERVERS_DIR}/${safe_name}/${PREFIX}-server-${safe_name}.pem" \
         "${DESTINATION}/${PREFIX}-client-${safe_name}.pem" \
         "${DESTINATION}/${PREFIX}-server-${safe_name}.pem"; do
         if [[ -f "${candidate}" ]]; then
@@ -511,24 +766,30 @@ cmd_revoke() {
     fi
 
     echo ">>> Revoking certificate '${name}'..."
+    mkdir -p "${CRL_DIR}"
     local crl_template
     crl_template="$(mktemp)"
     cat > "${crl_template}" <<EOF
 crl_next_update = 365
 crl_revocation_date = "$(date -u '+%Y-%m-%d %H:%M:%S')"
 EOF
-    local crl_out="${DESTINATION}/${PREFIX}-crl.pem"
+    local crl_out="${CRL_DIR}/${PREFIX}-crl.pem"
     certtool --generate-crl \
-        --load-ca-privkey "${DESTINATION}/${PREFIX}-root.key" \
-        --load-ca-certificate "${DESTINATION}/${PREFIX}-root.pem" \
+        --load-ca-privkey "${ROOT_KEY}" \
+        --load-ca-certificate "${ROOT_PEM}" \
         --load-certificate "${pem}" \
         --template "${crl_template}" \
         --outfile "${crl_out}"
+    chmod 644 "${crl_out}"
     rm -f "${crl_template}"
+
     echo "    ✓ CRL generated: ${crl_out}"
     echo ""
     echo "    To use in Nginx, add to your server block:"
     echo "      ssl_crl ${crl_out};"
+    echo ""
+    echo "    To use in HAProxy, add to your bind directive:"
+    echo "      crl-file ${crl_out}"
     log_action "REVOKE  ${pem}"
 }
 
@@ -541,15 +802,24 @@ cmd_deploy() {
     local remote_dir="${3:-/etc/pki/tls/certs}"
 
     if [[ -z "${server_name}" || -z "${remote}" ]]; then
-        echo "ERROR: Usage: $0 deploy ${PREFIX} <server_name> <user@host> [remote_dir]"
+        echo "ERROR: Usage: $0 deploy <prefix> <server_name> <user@host> [remote_dir]"
         exit 1
     fi
 
     local safe_name
     safe_name="$(sanitize "${server_name}")"
-    local crt="${DESTINATION}/${PREFIX}-server-${safe_name}.crt"
-    local key="${DESTINATION}/${PREFIX}-server-${safe_name}.key"
-    local ca="${DESTINATION}/${PREFIX}-root.pem"
+    local server_dir="${SERVERS_DIR}/${safe_name}"
+
+    local crt="${server_dir}/${PREFIX}-server-${safe_name}.crt"
+    local key="${server_dir}/${PREFIX}-server-${safe_name}.key"
+    local haproxy="${server_dir}/${PREFIX}-server-${safe_name}-haproxy.pem"
+    local ca="${ROOT_PEM}"
+
+    # Fallback to legacy path if not in server_dir
+    if [[ ! -f "${crt}" && -f "${DESTINATION}/${PREFIX}-server-${safe_name}.crt" ]]; then
+        crt="${DESTINATION}/${PREFIX}-server-${safe_name}.crt"
+        key="${DESTINATION}/${PREFIX}-server-${safe_name}.key"
+    fi
 
     for f in "${crt}" "${key}" "${ca}"; do
         if [[ ! -f "${f}" ]]; then
@@ -562,14 +832,24 @@ cmd_deploy() {
     echo ">>> Deploying server cert for '${server_name}' to ${remote}:${remote_dir} ..."
     ssh "${remote}" "mkdir -p ${remote_dir}"
     scp "${crt}" "${key}" "${ca}" "${remote}:${remote_dir}/"
+    if [[ -f "${haproxy}" ]]; then
+        scp "${haproxy}" "${remote}:${remote_dir}/"
+    fi
+
     echo "    ✓ ${PREFIX}-server-${safe_name}.crt"
     echo "    ✓ ${PREFIX}-server-${safe_name}.key"
-    echo "    ✓ ${PREFIX}-root.pem"
+    if [[ -f "${haproxy}" ]]; then
+        echo "    ✓ ${PREFIX}-server-${safe_name}-haproxy.pem (HAProxy bundle)"
+    fi
+    echo "    ✓ $(basename "${ca}")"
     echo ""
     echo "    Update your Nginx config:"
     echo "      ssl_certificate     ${remote_dir}/${PREFIX}-server-${safe_name}.crt;"
     echo "      ssl_certificate_key ${remote_dir}/${PREFIX}-server-${safe_name}.key;"
-    echo "      ssl_client_certificate ${remote_dir}/${PREFIX}-root.pem;"
+    echo "      ssl_client_certificate ${remote_dir}/$(basename "${ca}");"
+    echo ""
+    echo "    Or for HAProxy:"
+    echo "      bind *:443 ssl crt ${remote_dir}/${PREFIX}-server-${safe_name}-haproxy.pem ca-file ${remote_dir}/$(basename "${ca}") verify required"
     log_action "DEPLOY  ${PREFIX}-server-${safe_name} -> ${remote}:${remote_dir}"
 }
 
@@ -581,7 +861,7 @@ case "${COMMAND}" in
         mkdir -p "${DESTINATION}"
         make_root_certificate
         echo ""
-        echo "✅ Root CA generated in ${DESTINATION}/"
+        echo "✅ Root CA generated in ${CA_DIR}/"
         echo "   Now add servers and clients with:"
         echo "   $0 add-server ${PREFIX} <dns_or_ip>"
         echo "   $0 add-client ${PREFIX} <client_name>"
@@ -596,7 +876,7 @@ case "${COMMAND}" in
         require_root_ca
         make_server_certificate "${@:3}"
         echo ""
-        echo "✅ Server certificate for '${3}' generated in ${DESTINATION}/"
+        echo "✅ Server certificate for '${3}' generated in ${SERVERS_DIR}/$(sanitize "${3}")/"
         ;;
 
     add-client)
@@ -608,7 +888,7 @@ case "${COMMAND}" in
         require_root_ca
         make_client_certificate "${3}"
         echo ""
-        echo "✅ Client certificate for '${3}' generated in ${DESTINATION}/"
+        echo "✅ Client certificate for '${3}' generated in ${CLIENTS_DIR}/$(sanitize "${3}")/"
         ;;
 
     all)
@@ -670,6 +950,21 @@ case "${COMMAND}" in
         fi
         require_root_ca
         cmd_deploy "${3}" "${4}" "${5:-/etc/pki/tls/certs}"
+        ;;
+
+    export-client)
+        if [[ $# -lt 3 || -z "${3:-}" ]]; then
+            echo "ERROR: Missing client name."
+            echo "Usage: $0 export-client <prefix> <client_name> [output_archive]"
+            exit 1
+        fi
+        require_root_ca
+        cmd_export_client "${3}" "${4:-}"
+        ;;
+
+    migrate)
+        require_root_ca
+        echo "✅ Directory layout for prefix '${PREFIX}' is structured and up to date."
         ;;
 
     -h|--help|help)
