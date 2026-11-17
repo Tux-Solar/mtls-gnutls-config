@@ -202,6 +202,137 @@ This creates `myinfra-phone-sylvain-bundle.tar.gz` ready to send.
 ```
 Because `check-expiry` returns non-zero when certificates are expiring or expired, you can use it directly in cron jobs or monitoring scripts.
 
+### 6. Revoke a Certificate
+If a device is lost, stolen, or an account is decommissioned:
+```bash
+./mkcerts.sh revoke myinfra phone-sylvain
+```
+This generates or updates the Certificate Revocation List (CRL) at `_certs-myinfra/crl/myinfra-crl.pem`. See [Certificate Revocation & CRL](#certificate-revocation--crl) below for full details.
+
+---
+
+## Certificate Revocation & CRL
+
+In an mTLS environment, client certificates are signed by your Root CA and typically valid for 1 year or more. If a user leaves, or a mobile phone/laptop is lost or compromised, deleting files locally does **not** stop the device from connecting, because the certificate remains cryptographically valid.
+
+To block access immediately without having to replace your Root CA or regenerate all other client certificates, you use a **CRL (Certificate Revocation List)**.
+
+### How Revocation Works
+
+```mermaid
+sequenceDiagram
+    participant Admin as 👨‍💻 Admin
+    participant Script as mkcerts.sh
+    participant Server as 🖥️ Nginx / HAProxy
+    participant Revoked as 📱 Revoked Client
+    participant Valid as 💻 Valid Client
+
+    Admin->>Script: ./mkcerts.sh revoke myinfra phone-lost
+    Script-->>Admin: Updates _certs-myinfra/crl/myinfra-crl.pem
+    Admin->>Server: Copy CRL & reload service (systemctl reload nginx)
+    Valid->>Server: Connect with valid cert -> ✅ 200 OK
+    Revoked->>Server: Connect with revoked cert -> ⛔ 400 Bad Request (SSL error: certificate revoked)
+```
+
+### 1. Revoking a Certificate
+Run the `revoke` command with the prefix and the client (or server) name:
+
+```bash
+./mkcerts.sh revoke myinfra phone-sylvain
+```
+
+**What the script does:**
+- Finds the certificate in `clients/phone-sylvain/` or `servers/`.
+- Reads existing revoked certificates from `_certs-myinfra/crl/myinfra-crl.pem` if the CRL already exists, ensuring revocations are **cumulative** (revoking a second client will never un-revoke the first).
+- Signs a fresh CRL using your Root CA private key.
+- Saves the updated CRL to:
+  ```text
+  _certs-myinfra/crl/myinfra-crl.pem
+  ```
+- Logs the revocation in `_certs-myinfra/generation.log`.
+
+### 2. Inspecting the CRL
+You can inspect the contents of the generated CRL at any time using GnuTLS `certtool`:
+
+```bash
+certtool --crl-info --infile _certs-myinfra/crl/myinfra-crl.pem
+```
+
+Example output:
+```text
+X.509 Certificate Revocation List Information:
+    Version: 2
+    Issuer: UID=admin,CN=my-mtls-root-ca,OU=IT Security,O=MyCompany,ST=Bretagne,C=FR
+    Update dates:
+        Issued: Tue Nov 17 15:40:48 UTC 2026
+        Next at: Wed Nov 17 15:40:48 UTC 2027
+    Revoked certificates (2):
+        Serial Number (hex): 4fe2ac14b770d1ec5e595e98ad56bcea0c440bd5
+        Revoked at: Tue Nov 17 14:41:05 UTC 2026
+        Serial Number (hex): 524ffcaa8993022b2c0e2600fd3ac553f3239732
+        Revoked at: Tue Nov 17 15:10:22 UTC 2026
+```
+
+### 3. Enabling CRL in Nginx
+
+1. Copy `_certs-myinfra/crl/myinfra-crl.pem` to your Nginx server (e.g. `/etc/nginx/certs/myinfra-crl.pem`).
+2. Add the `ssl_crl` directive inside your `server { ... }` block:
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name home.example.com;
+
+    ssl_certificate     /etc/nginx/certs/myinfra-server-home.crt;
+    ssl_certificate_key /etc/nginx/certs/myinfra-server-home.key;
+
+    # mTLS Authentication
+    ssl_client_certificate /etc/nginx/certs/myinfra-root.pem;
+    ssl_verify_client on;
+
+    # Enable CRL check
+    ssl_crl /etc/nginx/certs/myinfra-crl.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+    }
+}
+```
+
+3. **Reload Nginx:**  
+   > [!IMPORTANT]  
+   > Nginx caches the CRL file in memory when workers start. Every time a certificate is revoked and the CRL file is updated on the server, you **must reload Nginx** for the revocation to take effect:
+   > ```bash
+   > sudo nginx -t && sudo systemctl reload nginx
+   > ```
+
+### 4. Enabling CRL in HAProxy
+
+In HAProxy, pass the `crl-file` option directly on the `bind` line alongside `ca-file`:
+
+```haproxy
+frontend https-in
+    bind *:443 ssl crt /etc/ssl/certs/myinfra-server-home-haproxy.pem ca-file /etc/ssl/ca/myinfra-root.pem verify required crl-file /etc/ssl/ca/myinfra-crl.pem
+```
+
+Reload HAProxy after copying an updated CRL:
+```bash
+sudo systemctl reload haproxy
+```
+
+### 5. What Happens When a Revoked Client Connects?
+
+- **Valid Client:** Completes the TLS handshake smoothly and receives HTTP 200 responses.
+- **Revoked Client:** Nginx terminates the TLS handshake immediately during client authentication and returns:
+  ```text
+  400 Bad Request
+  The SSL certificate error
+  ```
+  In Nginx's error log (`/var/log/nginx/error.log`), you will see:
+  ```text
+  client SSL certificate verify error: (23:certificate revoked) while reading client request headers
+  ```
+
 ---
 
 ## Reverse Proxy Deployment
