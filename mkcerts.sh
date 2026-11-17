@@ -774,12 +774,21 @@ crl_next_update = 365
 crl_revocation_date = "$(date -u '+%Y-%m-%d %H:%M:%S')"
 EOF
     local crl_out="${CRL_DIR}/${PREFIX}-crl.pem"
+    local crl_args=()
+    if [[ -f "${crl_out}" ]]; then
+        crl_args+=( "--load-crl" "${crl_out}" )
+    fi
+    local tmp_crl
+    tmp_crl="$(mktemp)"
+
     certtool --generate-crl \
         --load-ca-privkey "${ROOT_KEY}" \
         --load-ca-certificate "${ROOT_PEM}" \
+        "${crl_args[@]}" \
         --load-certificate "${pem}" \
         --template "${crl_template}" \
-        --outfile "${crl_out}"
+        --outfile "${tmp_crl}"
+    mv "${tmp_crl}" "${crl_out}"
     chmod 644 "${crl_out}"
     rm -f "${crl_template}"
 
