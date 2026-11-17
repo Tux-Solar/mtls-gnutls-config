@@ -135,8 +135,10 @@ The script follows a `command <prefix> [options]` pattern.
 | `list <prefix>` | List all certificates generated for this prefix with CN and expiry dates. |
 | `info <prefix> <name>` | Show full X.509 details for a specific certificate. |
 | `check-expiry <prefix> [days]` | Check certificates expiring within N days (default: 90). Returns exit code `0` (ok), `1` (expiring soon), or `2` (expired). |
-| `revoke <prefix> <name>` | Revoke a certificate and generate/update the CRL. |
-| `deploy <prefix> <host> <user@remote> [path]` | Copy server certs + root CA to a remote host via `scp`. |
+| `revoke <prefix> <name>` | Revoke a certificate (add to CRL). |
+| `unrevoke <prefix> <name>` | Cancel a revocation (remove from CRL). |
+| `clear-crl <prefix>` | Reset CRL to empty (clear all revocations). |
+| `deploy <prefix> <host> <user@remote> [path]` | Copy server certs + root CA + CRL to a remote host via `scp`. |
 | `migrate <prefix>` | Organize legacy flat directory layout into subdirectories. |
 
 ### Flags & Options
@@ -332,6 +334,41 @@ sudo systemctl reload haproxy
   ```text
   client SSL certificate verify error: (23:certificate revoked) while reading client request headers
   ```
+
+### 6. Can a Revocation Be Cancelled? (Restoring Access)
+
+Yes. If a certificate was revoked by mistake or during testing, you have two ways to restore access:
+
+#### Method A: Security Best Practice — Issue a New Certificate (Recommended in Production)
+If a device was revoked due to suspected loss, theft, or key leakage, **never re-enable an untrusted private key**. Instead, re-issue a fresh certificate:
+```bash
+./mkcerts.sh --force add-client myinfra phone-sylvain
+```
+- Generates a new key pair with a **brand new serial number**.
+- The compromised key remains blacklisted in your CRL forever.
+- The user imports the new `.pfx` bundle and connects immediately — **without touching the CRL or reloading Nginx**.
+
+#### Method B: Unrevoke the Certificate (Remove from CRL)
+If the revocation was a configuration test or an operational error and the private key is still secure, you can unrevoke it:
+```bash
+./mkcerts.sh unrevoke myinfra phone-sylvain
+```
+- Removes `phone-sylvain` from the active revocation list.
+- Rebuilds the CRL containing only the remaining revoked certificates (or an empty CRL if no other certs are revoked).
+- **Reload your web server** to apply the change:
+  ```bash
+  sudo systemctl reload nginx
+  ```
+
+#### Method C: Reset the Entire CRL (Clear All Revocations)
+To wipe all revocations and reset the CRL back to empty:
+```bash
+./mkcerts.sh clear-crl myinfra
+sudo systemctl reload nginx
+```
+
+> [!TIP]
+> **Initial Empty CRL:** When you run `./mkcerts.sh init <prefix>`, an initial, signed empty CRL is generated immediately at `_certs-<prefix>/crl/<prefix>-crl.pem`. This allows you to configure `ssl_crl` in Nginx and `crl-file` in HAProxy from Day 1 without triggering "file not found" errors during startup.
 
 ---
 

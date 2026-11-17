@@ -14,7 +14,7 @@ _mkcerts_completions() {
         cword=$COMP_CWORD
     fi
 
-    local commands="init add-server add-client all list info check-expiry revoke deploy export-client migrate"
+    local commands="init add-server add-client all list info check-expiry revoke unrevoke clear-crl deploy export-client migrate"
     local flags="--force"
 
     # Identify command position (skip flags)
@@ -51,7 +51,7 @@ _mkcerts_completions() {
         local cert_dir="_certs-$prefix"
         if [[ -d "$cert_dir" ]]; then
             case "$cmd" in
-                info|revoke)
+                info|revoke|unrevoke)
                     # List all server and client names (new directory layout and legacy flat)
                     local names=()
                     if [[ -d "$cert_dir/servers" ]]; then

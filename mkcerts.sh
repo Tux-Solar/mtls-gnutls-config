@@ -17,7 +17,9 @@ Commands:
   list          <prefix>                       List all generated certificates
   info          <prefix> <name>                Show details of a certificate
   check-expiry  <prefix> [days]                List certs expiring within N days (default: 90)
-  revoke        <prefix> <name>                Revoke a certificate (generate CRL)
+  revoke        <prefix> <name>                Revoke a certificate (add to CRL)
+  unrevoke      <prefix> <name>                Cancel revocation (remove from CRL)
+  clear-crl     <prefix>                       Clear all revocations (reset CRL to empty)
   deploy        <prefix> <server_name> <user@host> [remote_dir]
                                                Copy server cert + root CA via scp
   export-client <prefix> <client_name> [tar]   Create a ready-to-share client archive (.tar.gz)
@@ -382,6 +384,10 @@ make_root_certificate() {
     echo "    ✓ ${root_key} (private key, chmod 0600)"
     echo "    ✓ ${root_pem} (root CA certificate)"
     log_action "INIT    root CA: ${PREFIX}-root  CN=${CA_CN}  expiry=${CA_EXPIRY_DAYS}d"
+
+    # Also generate the initial empty CRL so Nginx / HAProxy can load it immediately
+    generate_empty_crl
+    echo "    ✓ ${CRL_DIR}/${PREFIX}-crl.pem (initial empty CRL)"
 }
 
 # Args: $1=primary_host  $@=extra_hosts (optional)
@@ -739,33 +745,29 @@ cmd_check_expiry() {
 }
 
 #-----------------------------
-# revoke: generate a CRL revoking a specific cert
+# Find cert pem by name
 #-----------------------------
-cmd_revoke() {
-    local name="${1:-}"
-    if [[ -z "${name}" ]]; then
-        echo "ERROR: Missing cert name. Usage: $0 revoke <prefix> <name>"
-        exit 1
-    fi
+find_cert_pem() {
+    local name="${1}"
     local safe_name
     safe_name="$(sanitize "${name}")"
-    local pem=""
     for candidate in \
         "${CLIENTS_DIR}/${safe_name}/${PREFIX}-client-${safe_name}.pem" \
         "${SERVERS_DIR}/${safe_name}/${PREFIX}-server-${safe_name}.pem" \
         "${DESTINATION}/${PREFIX}-client-${safe_name}.pem" \
         "${DESTINATION}/${PREFIX}-server-${safe_name}.pem"; do
         if [[ -f "${candidate}" ]]; then
-            pem="${candidate}"
-            break
+            echo "${candidate}"
+            return 0
         fi
     done
-    if [[ -z "${pem}" ]]; then
-        echo "ERROR: No certificate found for '${name}' in ${DESTINATION}/"
-        exit 1
-    fi
+    return 1
+}
 
-    echo ">>> Revoking certificate '${name}'..."
+#-----------------------------
+# Generate an empty signed CRL
+#-----------------------------
+generate_empty_crl() {
     mkdir -p "${CRL_DIR}"
     local crl_template
     crl_template="$(mktemp)"
@@ -774,32 +776,151 @@ crl_next_update = 365
 crl_revocation_date = "$(date -u '+%Y-%m-%d %H:%M:%S')"
 EOF
     local crl_out="${CRL_DIR}/${PREFIX}-crl.pem"
-    local crl_args=()
-    if [[ -f "${crl_out}" ]]; then
-        crl_args+=( "--load-crl" "${crl_out}" )
-    fi
-    local tmp_crl
-    tmp_crl="$(mktemp)"
-
     certtool --generate-crl \
         --load-ca-privkey "${ROOT_KEY}" \
         --load-ca-certificate "${ROOT_PEM}" \
-        "${crl_args[@]}" \
-        --load-certificate "${pem}" \
         --template "${crl_template}" \
-        --outfile "${tmp_crl}"
-    mv "${tmp_crl}" "${crl_out}"
+        --outfile "${crl_out}"
     chmod 644 "${crl_out}"
     rm -f "${crl_template}"
+    touch "${CRL_DIR}/revoked.txt"
+}
 
-    echo "    ✓ CRL generated: ${crl_out}"
+#-----------------------------
+# Rebuild the CRL from revoked.txt
+#-----------------------------
+rebuild_crl() {
+    mkdir -p "${CRL_DIR}"
+    local revoked_list="${CRL_DIR}/revoked.txt"
+    touch "${revoked_list}"
+
+    local crl_template
+    crl_template="$(mktemp)"
+    cat > "${crl_template}" <<EOF
+crl_next_update = 365
+crl_revocation_date = "$(date -u '+%Y-%m-%d %H:%M:%S')"
+EOF
+    local crl_out="${CRL_DIR}/${PREFIX}-crl.pem"
+    local crl_current
+    crl_current="$(mktemp)"
+
+    # 1. Base empty CRL
+    certtool --generate-crl \
+        --load-ca-privkey "${ROOT_KEY}" \
+        --load-ca-certificate "${ROOT_PEM}" \
+        --template "${crl_template}" \
+        --outfile "${crl_current}"
+
+    # 2. Accumulate all certificates listed in revoked.txt
+    while IFS= read -r pem_file; do
+        [[ -n "${pem_file}" && -f "${pem_file}" ]] || continue
+        local crl_next
+        crl_next="$(mktemp)"
+        certtool --generate-crl \
+            --load-ca-privkey "${ROOT_KEY}" \
+            --load-ca-certificate "${ROOT_PEM}" \
+            --load-crl "${crl_current}" \
+            --load-certificate "${pem_file}" \
+            --template "${crl_template}" \
+            --outfile "${crl_next}"
+        rm -f "${crl_current}"
+        crl_current="${crl_next}"
+    done < "${revoked_list}"
+
+    mv "${crl_current}" "${crl_out}"
+    chmod 644 "${crl_out}"
+    rm -f "${crl_template}"
+}
+
+#-----------------------------
+# revoke: generate or update CRL revoking a specific cert
+#-----------------------------
+cmd_revoke() {
+    local name="${1:-}"
+    if [[ -z "${name}" ]]; then
+        echo "ERROR: Missing cert name. Usage: $0 revoke <prefix> <name>"
+        exit 1
+    fi
+    local pem
+    if ! pem="$(find_cert_pem "${name}")"; then
+        echo "ERROR: No certificate found for '${name}' in ${DESTINATION}/"
+        exit 1
+    fi
+
+    echo ">>> Revoking certificate '${name}'..."
+    mkdir -p "${CRL_DIR}"
+    local revoked_list="${CRL_DIR}/revoked.txt"
+    touch "${revoked_list}"
+
+    if ! grep -Fxq "${pem}" "${revoked_list}" 2>/dev/null; then
+        echo "${pem}" >> "${revoked_list}"
+    fi
+
+    rebuild_crl
+
+    local crl_out="${CRL_DIR}/${PREFIX}-crl.pem"
+    echo "    ✓ CRL updated: ${crl_out}"
     echo ""
-    echo "    To use in Nginx, add to your server block:"
-    echo "      ssl_crl ${crl_out};"
-    echo ""
-    echo "    To use in HAProxy, add to your bind directive:"
-    echo "      crl-file ${crl_out}"
+    echo "    Remember to reload your web server:"
+    echo "      Nginx:   sudo systemctl reload nginx"
+    echo "      HAProxy: sudo systemctl reload haproxy"
     log_action "REVOKE  ${pem}"
+}
+
+#-----------------------------
+# unrevoke: cancel revocation of a certificate
+#-----------------------------
+cmd_unrevoke() {
+    local name="${1:-}"
+    if [[ -z "${name}" ]]; then
+        echo "ERROR: Missing cert name. Usage: $0 unrevoke <prefix> <name>"
+        exit 1
+    fi
+    local pem
+    if ! pem="$(find_cert_pem "${name}")"; then
+        echo "ERROR: No certificate found for '${name}' in ${DESTINATION}/"
+        exit 1
+    fi
+
+    local revoked_list="${CRL_DIR}/revoked.txt"
+    echo ">>> Unrevoking certificate '${name}'..."
+
+    if [[ -f "${revoked_list}" ]]; then
+        local tmp_list
+        tmp_list="$(mktemp)"
+        grep -Fxv "${pem}" "${revoked_list}" > "${tmp_list}" || true
+        mv "${tmp_list}" "${revoked_list}"
+    fi
+
+    rebuild_crl
+
+    local crl_out="${CRL_DIR}/${PREFIX}-crl.pem"
+    echo "    ✓ Certificate '${name}' unrevoked! CRL updated: ${crl_out}"
+    echo ""
+    echo "    Remember to reload your web server to apply the changes:"
+    echo "      Nginx:   sudo systemctl reload nginx"
+    echo "      HAProxy: sudo systemctl reload haproxy"
+    log_action "UNREVOKE ${pem}"
+}
+
+#-----------------------------
+# clear-crl: reset the CRL to empty
+#-----------------------------
+cmd_clear_crl() {
+    echo ">>> Clearing all certificate revocations for prefix '${PREFIX}'..."
+    mkdir -p "${CRL_DIR}"
+    local revoked_list="${CRL_DIR}/revoked.txt"
+    > "${revoked_list}"
+
+    rebuild_crl
+
+    local crl_out="${CRL_DIR}/${PREFIX}-crl.pem"
+    echo "    ✓ All revocations cleared! Empty CRL generated: ${crl_out}"
+    echo ""
+    echo "    Remember to reload your web server:"
+    echo "      Nginx:   sudo systemctl reload nginx"
+    echo "      HAProxy: sudo systemctl reload haproxy"
+    log_action "CLEAR-CRL"
 }
 
 #-----------------------------
@@ -823,6 +944,7 @@ cmd_deploy() {
     local key="${server_dir}/${PREFIX}-server-${safe_name}.key"
     local haproxy="${server_dir}/${PREFIX}-server-${safe_name}-haproxy.pem"
     local ca="${ROOT_PEM}"
+    local crl="${CRL_DIR}/${PREFIX}-crl.pem"
 
     # Fallback to legacy path if not in server_dir
     if [[ ! -f "${crt}" && -f "${DESTINATION}/${PREFIX}-server-${safe_name}.crt" ]]; then
@@ -844,6 +966,9 @@ cmd_deploy() {
     if [[ -f "${haproxy}" ]]; then
         scp "${haproxy}" "${remote}:${remote_dir}/"
     fi
+    if [[ -f "${crl}" ]]; then
+        scp "${crl}" "${remote}:${remote_dir}/"
+    fi
 
     echo "    ✓ ${PREFIX}-server-${safe_name}.crt"
     echo "    ✓ ${PREFIX}-server-${safe_name}.key"
@@ -851,14 +976,18 @@ cmd_deploy() {
         echo "    ✓ ${PREFIX}-server-${safe_name}-haproxy.pem (HAProxy bundle)"
     fi
     echo "    ✓ $(basename "${ca}")"
+    if [[ -f "${crl}" ]]; then
+        echo "    ✓ ${PREFIX}-crl.pem (Certificate Revocation List)"
+    fi
     echo ""
     echo "    Update your Nginx config:"
-    echo "      ssl_certificate     ${remote_dir}/${PREFIX}-server-${safe_name}.crt;"
-    echo "      ssl_certificate_key ${remote_dir}/${PREFIX}-server-${safe_name}.key;"
+    echo "      ssl_certificate         ${remote_dir}/${PREFIX}-server-${safe_name}.crt;"
+    echo "      ssl_certificate_key     ${remote_dir}/${PREFIX}-server-${safe_name}.key;"
     echo "      ssl_client_certificate ${remote_dir}/$(basename "${ca}");"
+    echo "      ssl_crl                 ${remote_dir}/${PREFIX}-crl.pem;"
     echo ""
     echo "    Or for HAProxy:"
-    echo "      bind *:443 ssl crt ${remote_dir}/${PREFIX}-server-${safe_name}-haproxy.pem ca-file ${remote_dir}/$(basename "${ca}") verify required"
+    echo "      bind *:443 ssl crt ${remote_dir}/${PREFIX}-server-${safe_name}-haproxy.pem ca-file ${remote_dir}/$(basename "${ca}") verify required crl-file ${remote_dir}/${PREFIX}-crl.pem"
     log_action "DEPLOY  ${PREFIX}-server-${safe_name} -> ${remote}:${remote_dir}"
 }
 
@@ -949,6 +1078,21 @@ case "${COMMAND}" in
         fi
         require_root_ca
         cmd_revoke "${3}"
+        ;;
+
+    unrevoke)
+        if [[ $# -lt 3 || -z "${3:-}" ]]; then
+            echo "ERROR: Missing cert name."
+            echo "Usage: $0 unrevoke <prefix> <name>"
+            exit 1
+        fi
+        require_root_ca
+        cmd_unrevoke "${3}"
+        ;;
+
+    clear-crl)
+        require_root_ca
+        cmd_clear_crl
         ;;
 
     deploy)
