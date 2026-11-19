@@ -560,12 +560,17 @@ Quick Installation:
 
 - Firefox:
   1. Settings > Privacy & Security > Certificates > View Certificates.
-  2. "Authorities" tab -> Import ${PREFIX}-root.pem (check "Trust this CA to identify websites").
-  3. "Your Certificates" tab -> Import ${PREFIX}-client-${safe_name}.pfx (enter password).
+  2. "Your Certificates" tab -> Import ${PREFIX}-client-${safe_name}.pfx (enter password).
+  3. (Optional) "Authorities" tab -> Import ${PREFIX}-root.pem (check "Trust this CA to identify websites").
 
-- Chrome / Edge / macOS Keychain / Windows:
-  1. Double click ${PREFIX}-root.pem to install into "Trusted Root Certification Authorities".
-  2. Double click ${PREFIX}-client-${safe_name}.pfx to import client certificate (enter password).
+- Chromium / Google Chrome / Brave:
+  1. Go to chrome://certificate-manager (or Settings > Privacy and security > Security > Manage certificates).
+  2. "Client certificates" tab -> Import ${PREFIX}-client-${safe_name}.pfx (enter password).
+  3. (Optional) "Authorities" tab -> Import ${PREFIX}-root.pem (check "Trust this certificate for identifying websites").
+
+- macOS / Windows:
+  1. Double click ${PREFIX}-client-${safe_name}.pfx to import client certificate into Keychain / Certificate Store (enter password).
+  2. (Optional) Double click ${PREFIX}-root.pem to install into "Trusted Root Certification Authorities".
 EOF
 
     rm -f "${tmp_template}"

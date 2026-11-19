@@ -426,26 +426,77 @@ backend web_backend
 
 ## Client Device Installation
 
-Each client needs two components:
-1. **Root CA** (`<prefix>-root.pem`): Installed as a trusted CA so the device trusts your server.
-2. **Client Identity** (`<prefix>-client-<name>.pfx`): Installed into the browser or system store to prove device identity.
+### Understanding Client vs Server Verification
 
-### Android
-1. Transfer `<prefix>-root.pem` and `<prefix>-client-<name>.pfx` to the device.
+In mTLS, authentication occurs in two independent directions:
+
+| Direction | Who verifies whom? | Where is the certificate checked? | What is required? |
+|:---|:---|:---|:---|
+| **Client $\rightarrow$ Server (mTLS)** | **Server (Nginx)** verifies the **Client** | On the **server**, via `ssl_client_certificate root.pem` | Browser only needs the `.pfx` in *"Your Certificates"*. The server performs the cryptographic check. |
+| **Server $\rightarrow$ Client (HTTPS)** | **Browser** verifies the **Server** | In the **browser**, via its *"Authorities"* store | If server uses public HTTPS (Let's Encrypt), browser already trusts it. If server uses private `<prefix>-server.crt`, browser needs `<prefix>-root.pem` in *"Authorities"* to avoid the untrusted CA warning. |
+
+> [!NOTE]
+> **Why did importing only the `.pfx` work in your browser?**  
+> 1. The `.pfx` container created by `mkcerts.sh` already embeds the Root CA certificate alongside your private key and client certificate.
+> 2. For mTLS authentication, **Nginx** validates your identity, not the browser. When Nginx sends a `CertificateRequest` for your CA during the TLS handshake, the browser simply picks the matching certificate from its client certificate store and sends it to Nginx. Nginx checks it against its local `ssl_client_certificate` and grants access.
+
+---
+
+### Desktop Browsers
+
+#### Firefox (Desktop)
+Firefox maintains its own isolated internal certificate database:
+1. Open **Settings > Privacy & Security > Certificates > View Certificates** (or navigate to `about:preferences#privacy`).
+2. **Client Identity:** Under **"Your Certificates"**, click **Import...**, select `<prefix>-client-<name>.pfx`, and enter the password (default: `9876543210`).
+3. **Server Trust (optional if using Let's Encrypt for server HTTPS):** Under **"Authorities"**, click **Import...**, select `<prefix>-root.pem`, and check *Trust this CA to identify websites*.
+
+#### Chromium / Google Chrome / Brave (Desktop)
+Chromium-based browsers handle certificates differently from Firefox. On Linux, Chromium uses the system/desktop certificate store (`~/.pki/nssdb`) or the new Chrome Certificate Manager (`chrome://certificate-manager`):
+
+##### Option A: Via Chromium GUI
+1. Navigate directly to `chrome://certificate-manager` (or `chrome://settings/certificates`, or **Settings > Privacy and security > Security > Manage certificates**).
+2. **Client Identity:**
+   - Under **"Client certificates"** (or **"Your certificates"**), click **Import** or **Add**.
+   - Select your `<prefix>-client-<name>.pfx` file and enter the password.
+   - When you visit your mTLS-protected site, Chromium will show a pop-up: *"Select a certificate: An identity needs to be proven to <domain>"*. Select your certificate and click **OK**.
+3. **Server Trust (if using private server certificates):**
+   - Under **"Authorities"** (or **"Trusted Certificates"** / **"Custom authorities"**), click **Import**.
+   - Select `<prefix>-root.pem` and check *"Trust this certificate for identifying websites"*.
+
+##### Option B: Via Linux CLI (NSS shared database)
+On Linux, you can import certificates into Chromium directly from the terminal using `libnss3-tools`:
+```bash
+# Install tools if needed:
+# Debian/Ubuntu/Mint: sudo apt install libnss3-tools
+# Fedora/RHEL:        sudo dnf install nss-tools
+
+# 1. Import client identity (.pfx) into Chromium:
+pk12util -d sql:$HOME/.pki/nssdb -i _certs-myinfra/clients/alice/myinfra-client-alice.pfx
+
+# 2. (Optional) Import Root CA into Chromium authorities:
+certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "my-mtls-root-ca" -i _certs-myinfra/ca/myinfra-root.pem
+
+# 3. List imported certificates:
+certutil -d sql:$HOME/.pki/nssdb -L
+```
+
+---
+
+### Mobile Devices
+
+#### Android
+Android requires the Root CA in the system store for applications and browsers:
+1. Transfer `<prefix>-root.pem` and `<prefix>-client-<name>.pfx` to the device (via USB, local download, Nextcloud, etc.).
 2. Go to **Settings > Security & Privacy > Encryption & credentials** (or **Install a certificate**).
-3. Tap **CA certificate** and select `<prefix>-root.pem`.
-4. Tap **VPN & app user certificate** and select `<prefix>-client-<name>.pfx` (enter password).
+3. Tap **CA certificate**, choose "Install anyway", and select `<prefix>-root.pem`.
+4. Tap **VPN & app user certificate**, select `<prefix>-client-<name>.pfx`, and enter the password.
+5. In Chrome or your browser, navigate to your site. Android will show a system pop-up asking you to authorize the certificate for this site.
 
-### iOS (iPhone / iPad)
-1. Send `<prefix>-root.pem` to your device via AirDrop or Mail.
-2. Go to **Settings > Profile Downloaded > Install**.
-3. Go to **Settings > General > About > Certificate Trust Settings** and enable full trust for your Root CA.
-4. Import `<prefix>-client-<name>.pfx` into your browser or device profile.
-
-### Firefox (Desktop)
-1. Open **Settings > Privacy & Security > Certificates > View Certificates**.
-2. Under **Authorities**, click **Import...** and select `<prefix>-root.pem` (check *Trust this CA to identify websites*).
-3. Under **Your Certificates**, click **Import...** and select `<prefix>-client-<name>.pfx` (enter password).
+#### iOS (iPhone / iPad)
+1. Send `<prefix>-root.pem` and `<prefix>-client-<name>.pfx` to your device via AirDrop or Mail.
+2. **Root CA:** Tap on `root.pem`, go to **Settings > Profile Downloaded > Install**.
+3. Go to **Settings > General > About > Certificate Trust Settings** and turn ON the toggle for your Root CA.
+4. **Client Identity:** Tap on `<prefix>-client-<name>.pfx`, install the profile, and enter the password. Safari will automatically negotiate mTLS.
 
 ---
 
