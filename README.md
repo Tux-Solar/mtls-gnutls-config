@@ -22,18 +22,27 @@ This is ideal for **self-hosted services** (Home Assistant, Nextcloud, mail serv
 
 ## Prerequisites
 
-- **GnuTLS** (`certtool` command) must be installed on your system:
+- **GnuTLS** (`certtool`): Required to generate ECDSA private keys, certificates, templates, and Certificate Revocation Lists (CRL).
+- **OpenSSL** (`openssl`): Strongly recommended for packaging client certificates into universal PKCS#12 (`.pfx`) bundles. OpenSSL uses standard PBES2/PBKDF2 iteration counts that ensure seamless compatibility with Chromium, Google Chrome, Linux NSS, Firefox, Android, iOS, Windows, and macOS (avoiding `ERR_SSL_CLIENT_AUTH_SIGNATURE_FAILED`).
 
-  ```bash
-  # Fedora / RHEL / CentOS
-  sudo dnf install gnutls-utils
+Install both tools using your package manager:
 
-  # Debian / Ubuntu
-  sudo apt install gnutls-bin
+```bash
+# Debian / Ubuntu / Linux Mint
+sudo apt update && sudo apt install gnutls-bin openssl
 
-  # Arch Linux
-  sudo pacman -S gnutls
-  ```
+# Fedora / RHEL / CentOS
+sudo dnf install gnutls-utils openssl
+
+# Arch Linux
+sudo pacman -S gnutls openssl
+
+# Alpine Linux
+apk add gnutls-utils openssl
+
+# macOS (Homebrew)
+brew install gnutls openssl
+```
 
 ---
 
@@ -479,6 +488,17 @@ certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "my-mtls-root-ca" -i _certs-myin
 # 3. List imported certificates:
 certutil -d sql:$HOME/.pki/nssdb -L
 ```
+
+> [!TIP]
+> **Troubleshooting `ERR_SSL_CLIENT_AUTH_SIGNATURE_FAILED` in Chromium:**
+> If Chromium displays `ERR_SSL_CLIENT_AUTH_SIGNATURE_FAILED`, it means the browser selected the certificate but failed to compute the cryptographic signature using the private key.
+> - **Cause 1:** A `.pem` or `.crt` file was imported instead of the `.pfx` bundle. Public certificates do not contain the private key needed to sign the TLS handshake.
+> - **Cause 2:** GnuTLS `certtool --to-p12` uses 600,000 PBKDF2 iterations which can fail to decrypt inside Linux NSS/Chromium. `mkcerts.sh` automatically uses `openssl pkcs12 -export` when OpenSSL is installed to ensure 100% compatibility across Chromium, Firefox, Android, iOS, Windows, and macOS. If converting an older `.pfx` manually:
+>   ```bash
+>   openssl pkcs12 -in client.pfx -out /tmp/temp.pem -nodes
+>   openssl pkcs12 -export -in /tmp/temp.pem -out client-compatible.pfx
+>   rm -f /tmp/temp.pem
+>   ```
 
 ---
 

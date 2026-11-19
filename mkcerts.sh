@@ -513,13 +513,28 @@ make_client_certificate() {
     cat "${c_pem}" "${ROOT_PEM}" > "${c_crt}"
     chmod 644 "${c_crt}"
 
-    certtool \
-        --load-ca-certificate "${ROOT_PEM}" \
-        --load-privkey "${c_key}" \
-        --load-certificate "${c_pem}" \
-        --to-p12 --p12-name "${PREFIX}@${safe_name}" \
-        --password="${PASSWORD}" \
-        --outder --outfile "${c_pfx}"
+    # Export PKCS#12 (.pfx) bundle containing client cert, private key, and root CA.
+    # Prefer OpenSSL if available because GnuTLS certtool --to-p12 uses 600,000 PBKDF2 iterations
+    # which causes NSS / Chromium on Linux to fail signature computation (ERR_SSL_CLIENT_AUTH_SIGNATURE_FAILED).
+    if command -v openssl >/dev/null 2>&1; then
+        openssl pkcs12 -export \
+            -in "${c_pem}" \
+            -inkey "${c_key}" \
+            -certfile "${ROOT_PEM}" \
+            -out "${c_pfx}" \
+            -name "${PREFIX}@${safe_name}" \
+            -passout "pass:${PASSWORD}"
+    else
+        echo "   ⚠️  Notice: OpenSSL not detected. Using GnuTLS certtool for .pfx."
+        echo "      Tip: Install openssl for universal Chromium/Android/iOS compatibility."
+        certtool \
+            --load-ca-certificate "${ROOT_PEM}" \
+            --load-privkey "${c_key}" \
+            --load-certificate "${c_pem}" \
+            --to-p12 --p12-name "${PREFIX}@${safe_name}" \
+            --password="${PASSWORD}" \
+            --outder --outfile "${c_pfx}"
+    fi
     chmod 600 "${c_pfx}"
 
     # Copy Root CA to the client directory
